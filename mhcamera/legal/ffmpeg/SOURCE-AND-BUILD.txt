@@ -1,0 +1,81 @@
+FFmpeg 4.4.4 source and rebuild information (LGPL-2.1-or-later)
+================================================================
+
+Corresponding source
+--------------------
+Release attachment: ffmpeg-4.4.4.tar.xz
+Checksum attachment: ffmpeg-4.4.4.tar.xz.sha256
+Upstream URL: https://ffmpeg.org/releases/ffmpeg-4.4.4.tar.xz
+SHA-256: e80b380d595c809060f66f96a5d849511ef4a76a26b76eacf5778b94c3570309
+
+Publish the source archive and checksum beside the plugin package. The upstream
+URL records the source origin; the release also provides its own corresponding
+source attachment.
+
+Source and build changes
+------------------------
+The private libraries use the unmodified FFmpeg 4.4.4 source archive identified
+above. There are no changes to upstream source files. The build uses the
+configuration below and adds a per-object compiler flag to the generated
+ffbuild/config.mak before compilation:
+
+    libavcodec/hevcdsp.o: ECFLAGS += -fno-tree-vrp
+
+This compiler setting is part of the rebuild recipe even though it does not
+modify the upstream source archive.
+
+Portable rebuild configuration
+------------------------------
+The repository's scripts/build_ffmpeg.sh automates the private-library build.
+For a manual equivalent, extract the accompanying archive, make the AArch64
+Linux cross-compiler commands available in PATH, and set SYSROOT to the absolute
+path of the target glibc 2.38 sysroot. Run the following in the extracted source
+directory. This example uses the aarch64-linux-gnu- command prefix and the default
+Cortex-A53 CPU setting.
+
+    ln -s "$SYSROOT" sysroot
+    ./configure \
+      --prefix=/usr/local \
+      --enable-cross-compile \
+      --cross-prefix=aarch64-linux-gnu- \
+      --cc=aarch64-linux-gnu-gcc \
+      --sysroot=sysroot \
+      --arch=aarch64 --target-os=linux --pkg-config=false \
+      --cpu=cortex-a53 \
+      --extra-cflags='-O3 -mcpu=cortex-a53 -mtune=cortex-a53' \
+      --extra-ldflags='-Wl,--gc-sections -Wl,--build-id' \
+      --disable-everything --disable-gpl --disable-nonfree \
+      --disable-static --disable-autodetect \
+      --disable-bzlib --disable-iconv \
+      --disable-doc --disable-debug --disable-swscale --disable-swresample \
+      --disable-avresample --disable-postproc --disable-avdevice \
+      --disable-avfilter --disable-programs --disable-zlib \
+      --enable-shared --enable-pic --enable-avcodec --disable-avformat \
+      --enable-avutil --disable-network --enable-asm --enable-neon \
+      --enable-hardcoded-tables --enable-optimizations \
+      --enable-parser=hevc --enable-decoder=hevc
+    printf '%s\n' 'libavcodec/hevcdsp.o: ECFLAGS += -fno-tree-vrp' >> ffbuild/config.mak
+    make
+    make DESTDIR="$DESTDIR" install
+
+Set DESTDIR to the desired staging directory before installation. It is supplied
+only at install time, so it is not embedded in the library configuration string.
+The sysroot is referenced through a local symlink, and compiler commands use
+names resolved through PATH, to keep machine-specific absolute paths out of the
+configuration string.
+
+The default libraries target Linux ARM64 with glibc 2.38. If a distributor changes
+the CPU setting or other build options, its corresponding rebuild record must
+state those changes.
+
+Distribution and license
+------------------------
+The plugin dynamically links its private libavcodec and libavutil libraries.
+The private build contains only the HEVC parser and decoder needed by the
+video-only H.265 path. It does not build libavformat, network protocols,
+demuxers, muxers, H.264 decoding, FFmpeg/ffprobe command-line programs, audio
+processing, encoders, swscale, swresample, GPL components, or nonfree components.
+
+COPYING.LGPLv2.1 in this directory is the license text from the FFmpeg 4.4.4
+upstream source archive. Preserve it, this rebuild record, and access to the
+matching source attachment when distributing the private libraries.

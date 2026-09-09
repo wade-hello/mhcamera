@@ -1,0 +1,638 @@
+diff --git a/internal/xiaomi/xiaomi.go b/internal/xiaomi/xiaomi.go
+index 75a191b..bb72648 100644
+--- a/internal/xiaomi/xiaomi.go
++++ b/internal/xiaomi/xiaomi.go
+@@ -18,6 +18,7 @@ import (
+ 	"github.com/AlexxIT/go2rtc/pkg/core"
+ 	"github.com/AlexxIT/go2rtc/pkg/xiaomi"
+ 	"github.com/AlexxIT/go2rtc/pkg/xiaomi/crypto"
++	"github.com/rs/zerolog"
+ )
+ 
+ func Init() {
+@@ -29,6 +30,7 @@ func Init() {
+ 	tokens = v.Cfg
+ 
+ 	log := app.GetLogger("xiaomi")
++	cloudLog = log
+ 
+ 	streams.HandleFunc("xiaomi", func(rawURL string) (core.Producer, error) {
+ 		u, err := url.Parse(rawURL)
+@@ -54,29 +56,132 @@ func Init() {
+ 
+ var tokens map[string]string
+ var clouds map[string]*xiaomi.Cloud
++var credentialRejections map[string]cloudCredentialRejection
+ var cloudsMu sync.Mutex
+ var xiaomiPhoneAuth = newPhoneBootstrap(phoneDependencies{})
++var cloudLog = zerolog.Nop()
++
++var authenticateCloudToken = func(userID, passToken string) (*xiaomi.Cloud, string, string, error) {
++	cloud := xiaomi.NewCloud(AppXiaomiHome)
++	if err := cloud.LoginWithToken(userID, passToken); err != nil {
++		return nil, "", "", err
++	}
++	rotatedUserID, rotatedToken := cloud.UserToken()
++	return cloud, rotatedUserID, rotatedToken, nil
++}
++
++var persistCloudToken = app.PatchConfig
++
++var requestCloud = func(ctx context.Context, cloud *xiaomi.Cloud, baseURL, apiURL, params string) ([]byte, error) {
++	return cloud.RequestWithContext(ctx, baseURL, apiURL, params, nil)
++}
+ 
+ func getCloud(userID string) (*xiaomi.Cloud, error) {
+ 	cloudsMu.Lock()
+ 	defer cloudsMu.Unlock()
+ 
+-	if cloud := clouds[userID]; cloud != nil {
++	cloud := clouds[userID]
++	if err := cachedCredentialRejectionLocked(userID, cloud); err != nil {
++		return nil, err
++	}
++	if cloud != nil {
+ 		return cloud, nil
+ 	}
+ 
+-	cloud := xiaomi.NewCloud(AppXiaomiHome)
+-	if err := cloud.LoginWithToken(userID, tokens[userID]); err != nil {
++	return establishCloudLocked(userID)
++}
++
++func establishCloudLocked(userID string) (*xiaomi.Cloud, error) {
++	passToken := tokens[userID]
++	if passToken == "" {
++		return nil, &xiaomi.CloudError{Kind: xiaomi.CloudErrorCredentialRejected}
++	}
++	cloud, rotatedUserID, rotatedToken, err := authenticateCloudToken(userID, passToken)
++	if err != nil {
+ 		return nil, err
+ 	}
++	if cloud == nil || rotatedUserID != userID || rotatedToken == "" {
++		return nil, &xiaomi.CloudError{Kind: xiaomi.CloudErrorProtocol}
++	}
++	if rotatedToken != passToken {
++		if err = persistCloudToken([]string{"xiaomi", userID}, rotatedToken); err != nil {
++			return nil, &xiaomi.CloudError{Kind: xiaomi.CloudErrorProtocol, Err: err}
++		}
++		if tokens == nil {
++			tokens = make(map[string]string)
++		}
++		tokens[userID] = rotatedToken
++		logCloudRenewal(userID, "token_rotated")
++	}
+ 	if clouds == nil {
+ 		clouds = map[string]*xiaomi.Cloud{userID: cloud}
+ 	} else {
+ 		clouds[userID] = cloud
+ 	}
++	delete(credentialRejections, userID)
+ 	return cloud, nil
+ }
+ 
++type cloudCredentialRejection struct {
++	cloud     *xiaomi.Cloud
++	passToken string
++	err       error
++}
++
++func renewCloud(userID string, stale *xiaomi.Cloud) (*xiaomi.Cloud, error) {
++	if !cloudsMu.TryLock() {
++		logCloudRenewal(userID, "singleflight_wait")
++		cloudsMu.Lock()
++	}
++	defer cloudsMu.Unlock()
++
++	current := clouds[userID]
++	if current != nil && current != stale {
++		delete(credentialRejections, userID)
++		return current, nil
++	}
++	if err := cachedCredentialRejectionLocked(userID, current); err != nil {
++		return nil, err
++	}
++	passToken := tokens[userID]
++	logCloudRenewal(userID, "login_started")
++	cloud, err := establishCloudLocked(userID)
++	if passToken != "" && cloudErrorIs(err, xiaomi.CloudErrorCredentialRejected) {
++		if credentialRejections == nil {
++			credentialRejections = make(map[string]cloudCredentialRejection)
++		}
++		credentialRejections[userID] = cloudCredentialRejection{
++			cloud: stale, passToken: passToken, err: err,
++		}
++	}
++	return cloud, err
++}
++
++func cachedCredentialRejectionLocked(userID string, current *xiaomi.Cloud) error {
++	rejection, ok := credentialRejections[userID]
++	if !ok {
++		return nil
++	}
++	passToken := tokens[userID]
++	if passToken == "" || passToken != rejection.passToken ||
++		current != nil && current != rejection.cloud {
++		delete(credentialRejections, userID)
++		return nil
++	}
++	return rejection.err
++}
++
++func logCloudRenewal(userID, stage string) {
++	cloudLog.Info().Str("account", maskXiaomiAccount(userID)).Str("stage", stage).Msg("xiaomi cloud renewal")
++}
++
++func maskXiaomiAccount(userID string) string {
++	if len(userID) <= 4 {
++		return "****"
++	}
++	return userID[:2] + "******" + userID[len(userID)-2:]
++}
++
+ func cloudRequest(userID, region, apiURL, params string) ([]byte, error) {
+ 	return cloudRequestContext(context.Background(), userID, region, apiURL, params)
+ }
+@@ -94,7 +199,26 @@ func cloudRequestContext(ctx context.Context, userID, region, apiURL, params str
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	return cloud.RequestWithContext(ctx, baseURL, apiURL, params, nil)
++	body, err := requestCloud(ctx, cloud, baseURL, apiURL, params)
++	if !cloudErrorIs(err, xiaomi.CloudErrorSessionRejected) {
++		return body, err
++	}
++
++	logCloudRenewal(userID, "detected")
++	cloud, err = renewCloud(userID, cloud)
++	if err != nil {
++		if cloudErrorIs(err, xiaomi.CloudErrorCredentialRejected) {
++			logCloudRenewal(userID, "reauth_required")
++		}
++		return nil, err
++	}
++	logCloudRenewal(userID, "request_retried")
++	return requestCloud(ctx, cloud, baseURL, apiURL, params)
++}
++
++func cloudErrorIs(err error, kind xiaomi.CloudErrorKind) bool {
++	var cloudErr *xiaomi.CloudError
++	return errors.As(err, &cloudErr) && cloudErr.Kind == kind
+ }
+ 
+ func cloudUserRequest(user *url.Userinfo, apiURL, params string) ([]byte, error) {
+@@ -259,17 +383,17 @@ func apiDeviceListWithLoader(w http.ResponseWriter, r *http.Request, loader cata
+ 		return
+ 	}
+ 	if !hasUser || !hasRegion || len(query["id"]) != 1 || len(query["region"]) != 1 {
+-		http.Error(w, errInvalidRegion.Error(), http.StatusBadRequest)
++		writeCatalogError(w, errInvalidCatalogRequest)
+ 		return
+ 	}
+ 	user := query.Get("id")
+ 	if !isDecimalID(user) {
+-		http.Error(w, "xiaomi: invalid account id", http.StatusBadRequest)
++		writeCatalogError(w, errInvalidCatalogRequest)
+ 		return
+ 	}
+ 	region, err := parseRegion(query.Get("region"))
+ 	if err != nil {
+-		http.Error(w, err.Error(), http.StatusBadRequest)
++		writeCatalogError(w, err)
+ 		return
+ 	}
+ 
+@@ -288,14 +412,56 @@ func apiDeviceListWithLoader(w http.ResponseWriter, r *http.Request, loader cata
+ 	}()
+ 
+ 	if err != nil {
+-		http.Error(w, err.Error(), http.StatusInternalServerError)
++		writeCatalogError(w, err)
+ 	}
+ }
+ 
++func writeCatalogError(w http.ResponseWriter, err error) {
++	status := http.StatusBadGateway
++	response := catalogErrorResponse{
++		State:      "error",
++		ErrorKind:  xiaomi.CloudErrorUnknown,
++		MessageKey: "xiaomi_request_failed",
++	}
++
++	switch {
++	case errors.Is(err, errInvalidRegion):
++		status = http.StatusBadRequest
++		response.ErrorKind = xiaomi.CloudErrorProtocol
++		response.MessageKey = "invalid_region"
++	case errors.Is(err, errInvalidCatalogRequest):
++		status = http.StatusBadRequest
++		response.ErrorKind = xiaomi.CloudErrorProtocol
++		response.MessageKey = "invalid_request"
++	case errors.Is(err, errCatalogIncomplete):
++		response.ErrorKind = xiaomi.CloudErrorProtocol
++		response.MessageKey = "catalog_incomplete"
++	default:
++		var cloudErr *xiaomi.CloudError
++		if errors.As(err, &cloudErr) {
++			response.ErrorKind = cloudErr.Kind
++			response.RequestStageCode = cloudErr.RequestStageCode
++			if cloudErr.Kind == xiaomi.CloudErrorNetwork {
++				response.NetworkReasonCode = cloudErr.NetworkReasonCode
++			}
++			if cloudErr.Kind == xiaomi.CloudErrorCredentialRejected {
++				status = http.StatusUnauthorized
++				response.MessageKey = "xiaomi_reauthorization_required"
++				response.ReasonCode = authReasonPassTokenRejected
++			}
++		}
++	}
++
++	w.Header().Set("Content-Type", api.MimeJSON)
++	w.WriteHeader(status)
++	_ = json.NewEncoder(w).Encode(response)
++}
++
+ const catalogRequestTimeout = 45 * time.Second
+ 
+ var errCatalogIncomplete = errors.New("xiaomi: catalog incomplete")
+ var errInvalidRegion = errors.New("xiaomi: invalid region")
++var errInvalidCatalogRequest = errors.New("xiaomi: invalid catalog request")
+ 
+ type catalogRequestFunc func(context.Context, string, string) ([]byte, error)
+ 
+@@ -339,6 +505,17 @@ type catalogSnapshot struct {
+ 
+ type catalogLoaderFunc func(context.Context, string, Region) (*catalogSnapshot, error)
+ 
++type catalogErrorResponse struct {
++	RequestStageCode  xiaomi.RequestStage   `json:"request_stage_code"`
++	NetworkReasonCode xiaomi.NetworkReason  `json:"network_reason_code"`
++	State             string                `json:"state"`
++	ErrorKind         xiaomi.CloudErrorKind `json:"error_kind"`
++	MessageKey        string                `json:"message_key"`
++	ReasonCode        int                   `json:"reason_code,omitempty"`
++}
++
++const authReasonPassTokenRejected = 4
++
+ type deviceLocation struct {
+ 	homeID   xiaomiValue
+ 	homeName string
+diff --git a/pkg/xiaomi/cloud.go b/pkg/xiaomi/cloud.go
+index f97c871..592efab 100644
+--- a/pkg/xiaomi/cloud.go
++++ b/pkg/xiaomi/cloud.go
+@@ -11,7 +11,6 @@ import (
+ 	"encoding/base64"
+ 	"encoding/binary"
+ 	"encoding/json"
+-	"errors"
+ 	"fmt"
+ 	"io"
+ 	"net/http"
+@@ -36,6 +35,45 @@ type Cloud struct {
+ 	auth map[string]string
+ }
+ 
++type CloudErrorKind uint8
++
++const (
++	CloudErrorUnknown CloudErrorKind = iota
++	CloudErrorNetwork
++	CloudErrorHTTP
++	CloudErrorProvider
++	CloudErrorSessionRejected
++	CloudErrorCredentialRejected
++	CloudErrorProtocol
++)
++
++type CloudError struct {
++	Kind              CloudErrorKind
++	RequestStageCode  RequestStage
++	NetworkReasonCode NetworkReason
++	HTTPStatus        int
++	ProviderCode      int
++	Err               error `json:"-"`
++	safeMessage       string
++}
++
++func (e *CloudError) Error() string {
++	if e.safeMessage != "" {
++		return "xiaomi: " + e.safeMessage
++	}
++	return fmt.Sprintf("xiaomi cloud error (kind %d)", e.Kind)
++}
++
++func (e *CloudError) Unwrap() error { return e.Err }
++
++func newCloudError(kind CloudErrorKind, stage RequestStage, err error) error {
++	reason := NetworkReasonUnknown
++	if kind == CloudErrorNetwork {
++		reason = classifyNetworkError(err)
++	}
++	return &CloudError{Kind: kind, RequestStageCode: stage, NetworkReasonCode: reason, Err: err}
++}
++
+ func NewCloud(sid string) *Cloud {
+ 	return &Cloud{
+ 		client: &http.Client{Timeout: 15 * time.Second},
+@@ -315,11 +353,25 @@ func (l *LoginError) Error() string {
+ }
+ 
+ func (c *Cloud) finishAuth(location string) error {
++	return c.finishAuthResponse(location, CloudErrorHTTP, false)
++}
++
++func (c *Cloud) finishAuthResponse(location string, rejectionKind CloudErrorKind, requireSession bool) error {
++	if location == "" {
++		return newCloudError(CloudErrorProtocol, RequestStageTokenFinish, nil)
++	}
+ 	res, err := c.client.Get(location)
+ 	if err != nil {
+-		return err
++		return newCloudError(CloudErrorNetwork, RequestStageTokenFinish, err)
+ 	}
+ 	defer res.Body.Close()
++	if res.StatusCode != http.StatusOK {
++		kind := CloudErrorHTTP
++		if res.StatusCode == http.StatusUnauthorized {
++			kind = rejectionKind
++		}
++		return &CloudError{Kind: kind, RequestStageCode: RequestStageTokenFinish, HTTPStatus: res.StatusCode}
++	}
+ 
+ 	// LoginWithVerify
+ 	//   - userId, cUserId, serviceToken from cookies
+@@ -348,7 +400,7 @@ func (c *Cloud) finishAuth(location string) error {
+ 				Ssecurity []byte `json:"ssecurity"`
+ 			}
+ 			if err = json.Unmarshal([]byte(s), &v1); err != nil {
+-				return err
++				return newCloudError(CloudErrorProtocol, RequestStageTokenFinish, err)
+ 			}
+ 			c.ssecurity = v1.Ssecurity
+ 		}
+@@ -357,36 +409,64 @@ func (c *Cloud) finishAuth(location string) error {
+ 	}
+ 
+ 	c.cookies = fmt.Sprintf("userId=%s; cUserId=%s; serviceToken=%s", c.userID, cUserId, serviceToken)
++	if requireSession && (c.userID == "" || cUserId == "" || serviceToken == "" || len(c.ssecurity) == 0) {
++		return newCloudError(CloudErrorProtocol, RequestStageTokenFinish, nil)
++	}
+ 
+ 	return nil
+ }
+ 
+ func (c *Cloud) LoginWithToken(userID, passToken string) error {
++	if userID == "" || passToken == "" {
++		return newCloudError(CloudErrorCredentialRejected, RequestStageTokenLogin, nil)
++	}
+ 	req, err := http.NewRequest("GET", "https://account.xiaomi.com/pass/serviceLogin?_json=true&sid="+c.sid, nil)
+ 	if err != nil {
+-		return err
++		return newCloudError(CloudErrorProtocol, RequestStageTokenLogin, err)
+ 	}
+ 
+ 	req.Header.Set("Cookie", fmt.Sprintf("userId=%s; passToken=%s", userID, passToken))
+ 
+ 	res, err := c.client.Do(req)
+ 	if err != nil {
+-		return err
++		return newCloudError(CloudErrorNetwork, RequestStageTokenLogin, err)
++	}
++	if res.StatusCode != http.StatusOK {
++		defer res.Body.Close()
++		kind := CloudErrorHTTP
++		if res.StatusCode == http.StatusUnauthorized {
++			kind = CloudErrorCredentialRejected
++		}
++		return &CloudError{Kind: kind, RequestStageCode: RequestStageTokenLogin, HTTPStatus: res.StatusCode}
+ 	}
+ 
+ 	var v1 struct {
++		Code      int    `json:"code"`
+ 		Ssecurity []byte `json:"ssecurity"`
+ 		PassToken string `json:"passToken"`
+ 		Location  string `json:"location"`
+ 	}
+-	if _, err = readLoginResponse(res.Body, &v1); err != nil {
++	if err = readTokenLoginResponse(res.Body, &v1); err != nil {
+ 		return err
+ 	}
++	if v1.Code != 0 {
++		kind := CloudErrorProvider
++		if v1.Code == 70016 {
++			kind = CloudErrorCredentialRejected
++		}
++		return &CloudError{Kind: kind, RequestStageCode: RequestStageTokenLogin, ProviderCode: v1.Code}
++	}
+ 
+ 	c.ssecurity = v1.Ssecurity
+ 	c.passToken = v1.PassToken
+ 
+-	return c.finishAuth(v1.Location)
++	if err = c.finishAuthResponse(v1.Location, CloudErrorCredentialRejected, true); err != nil {
++		return err
++	}
++	if c.userID != userID || c.passToken == "" {
++		return newCloudError(CloudErrorProtocol, RequestStageTokenFinish, nil)
++	}
++	return nil
+ }
+ 
+ func (c *Cloud) UserToken() (string, string) {
+@@ -410,7 +490,7 @@ func (c *Cloud) RequestWithContext(ctx context.Context, baseURL, apiURL, params
+ 	for _, v := range form {
+ 		ciphertext, err := crypt(signedNonce, []byte(v[0]))
+ 		if err != nil {
+-			return nil, err
++			return nil, newCloudError(CloudErrorProtocol, RequestStageCloudAPI, err)
+ 		}
+ 		v[0] = base64.StdEncoding.EncodeToString(ciphertext)
+ 	}
+@@ -423,7 +503,7 @@ func (c *Cloud) RequestWithContext(ctx context.Context, baseURL, apiURL, params
+ 
+ 	req, err := http.NewRequestWithContext(ctx, "POST", baseURL+apiURL, strings.NewReader(form.Encode()))
+ 	if err != nil {
+-		return nil, err
++		return nil, newCloudError(CloudErrorProtocol, RequestStageCloudAPI, err)
+ 	}
+ 
+ 	req.Header.Set("Cookie", c.cookies)
+@@ -435,27 +515,31 @@ func (c *Cloud) RequestWithContext(ctx context.Context, baseURL, apiURL, params
+ 
+ 	res, err := c.client.Do(req)
+ 	if err != nil {
+-		return nil, err
++		return nil, newCloudError(CloudErrorNetwork, RequestStageCloudAPI, err)
+ 	}
+ 	defer res.Body.Close()
+ 
+ 	if res.StatusCode != http.StatusOK {
+-		return nil, errors.New(res.Status)
++		kind := CloudErrorHTTP
++		if res.StatusCode == http.StatusUnauthorized {
++			kind = CloudErrorSessionRejected
++		}
++		return nil, &CloudError{Kind: kind, RequestStageCode: RequestStageCloudAPI, HTTPStatus: res.StatusCode}
+ 	}
+ 
+ 	body, err := io.ReadAll(res.Body)
+ 	if err != nil {
+-		return nil, err
++		return nil, newCloudError(CloudErrorNetwork, RequestStageCloudAPI, err)
+ 	}
+ 
+ 	ciphertext, err := base64.StdEncoding.DecodeString(string(body))
+ 	if err != nil {
+-		return nil, err
++		return nil, newCloudError(CloudErrorProtocol, RequestStageCloudAPI, err)
+ 	}
+ 
+ 	plaintext, err := crypt(signedNonce, ciphertext)
+ 	if err != nil {
+-		return nil, err
++		return nil, newCloudError(CloudErrorProtocol, RequestStageCloudAPI, err)
+ 	}
+ 
+ 	var res1 struct {
+@@ -464,16 +548,38 @@ func (c *Cloud) RequestWithContext(ctx context.Context, baseURL, apiURL, params
+ 		Result  json.RawMessage `json:"result"`
+ 	}
+ 	if err = json.Unmarshal(plaintext, &res1); err != nil {
+-		return nil, err
++		return nil, newCloudError(CloudErrorProtocol, RequestStageCloudAPI, err)
+ 	}
+ 
+ 	if res1.Code != 0 {
+-		return nil, errors.New("xiaomi: " + res1.Message)
++		cloudErr := &CloudError{Kind: CloudErrorProvider, RequestStageCode: RequestStageCloudAPI, ProviderCode: res1.Code}
++		// Preserve the established MISS-to-legacy fallback without retaining
++		// arbitrary provider messages in errors or logs.
++		if res1.Message == "no available vendor support" {
++			cloudErr.safeMessage = res1.Message
++		}
++		return nil, cloudErr
+ 	}
+ 
+ 	return res1.Result, nil
+ }
+ 
++func readTokenLoginResponse(rc io.ReadCloser, v any) error {
++	defer rc.Close()
++	body, err := io.ReadAll(rc)
++	if err != nil {
++		return newCloudError(CloudErrorNetwork, RequestStageTokenLogin, err)
++	}
++	body, ok := bytes.CutPrefix(body, []byte("&&&START&&&"))
++	if !ok {
++		return newCloudError(CloudErrorProtocol, RequestStageTokenLogin, nil)
++	}
++	if err = json.Unmarshal(body, v); err != nil {
++		return newCloudError(CloudErrorProtocol, RequestStageTokenLogin, err)
++	}
++	return nil
++}
++
+ func readLoginResponse(rc io.ReadCloser, v any) ([]byte, error) {
+ 	defer rc.Close()
+ 
+diff --git a/pkg/xiaomi/cloud_diagnostics.go b/pkg/xiaomi/cloud_diagnostics.go
+index e69de29..f234d6b 100644
+--- a/pkg/xiaomi/cloud_diagnostics.go
++++ b/pkg/xiaomi/cloud_diagnostics.go
+@@ -0,0 +1,93 @@
++package xiaomi
++
++import (
++	"context"
++	"crypto/tls"
++	"crypto/x509"
++	"errors"
++	"io"
++	"net"
++	"syscall"
++)
++
++type RequestStage uint8
++
++const (
++	RequestStageUnknown RequestStage = iota
++	RequestStageTokenLogin
++	RequestStageTokenFinish
++	RequestStageCloudAPI
++	// Stage 4 is reserved for the product's local Unix RPC caller.
++)
++
++type NetworkReason uint8
++
++const (
++	NetworkReasonUnknown NetworkReason = iota
++	NetworkReasonDNS
++	NetworkReasonConnect
++	NetworkReasonTimeout
++	NetworkReasonTLSCertificate
++	NetworkReasonTLSHandshake
++	NetworkReasonCancelled
++	NetworkReasonIO
++)
++
++// Only typed causes and operation metadata are diagnostic evidence. Unknown
++// errors stay unknown; neither error text nor URLs are inspected or exported.
++func classifyNetworkError(err error) NetworkReason {
++	if errors.Is(err, context.Canceled) {
++		return NetworkReasonCancelled
++	}
++	if errors.Is(err, context.DeadlineExceeded) || networkTimeout(err) {
++		return NetworkReasonTimeout
++	}
++	var dns *net.DNSError
++	if errors.As(err, &dns) {
++		return NetworkReasonDNS
++	}
++	var certificate *tls.CertificateVerificationError
++	var authority x509.UnknownAuthorityError
++	var hostname x509.HostnameError
++	var invalid x509.CertificateInvalidError
++	var roots x509.SystemRootsError
++	if errors.As(err, &certificate) || errors.As(err, &authority) || errors.As(err, &hostname) || errors.As(err, &invalid) || errors.As(err, &roots) {
++		return NetworkReasonTLSCertificate
++	}
++	var record tls.RecordHeaderError
++	var alert tls.AlertError
++	if errors.As(err, &record) || errors.As(err, &alert) {
++		return NetworkReasonTLSHandshake
++	}
++	var operation *net.OpError
++	if errors.As(err, &operation) && operation.Op == "dial" {
++		return NetworkReasonConnect
++	}
++	if errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ENETUNREACH) || errors.Is(err, syscall.EHOSTUNREACH) {
++		return NetworkReasonConnect
++	}
++	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.ErrClosedPipe) || errors.Is(err, net.ErrClosed) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) || (operation != nil && (operation.Op == "read" || operation.Op == "write")) {
++		return NetworkReasonIO
++	}
++	return NetworkReasonUnknown
++}
++
++// A url.Error can implement Timeout yet return false when a wrapping error
++// hides its inner net.Error. Inspect the chain, not just its first net.Error.
++func networkTimeout(err error) bool {
++	if network, ok := err.(net.Error); ok && network.Timeout() {
++		return true
++	}
++	if joined, ok := err.(interface{ Unwrap() []error }); ok {
++		for _, cause := range joined.Unwrap() {
++			if networkTimeout(cause) {
++				return true
++			}
++		}
++		return false
++	}
++	if cause := errors.Unwrap(err); cause != nil {
++		return networkTimeout(cause)
++	}
++	return false
++}

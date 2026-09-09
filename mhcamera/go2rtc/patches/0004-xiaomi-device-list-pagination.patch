@@ -1,0 +1,318 @@
+diff --git a/internal/xiaomi/xiaomi.go b/internal/xiaomi/xiaomi.go
+index 41a1622d19192d590aee6e1ef6ee6bdfc90d701f..87b4083232c25563d2d12e5c228a425d0108c9ea 100644
+--- a/internal/xiaomi/xiaomi.go
++++ b/internal/xiaomi/xiaomi.go
+@@ -1,6 +1,7 @@
+ package xiaomi
+ 
+ import (
++	"context"
+ 	"encoding/hex"
+ 	"encoding/json"
+ 	"errors"
+@@ -9,6 +10,7 @@ import (
+ 	"net/url"
+ 	"strings"
+ 	"sync"
++	"time"
+ 
+ 	"github.com/AlexxIT/go2rtc/internal/api"
+ 	"github.com/AlexxIT/go2rtc/internal/app"
+@@ -76,11 +78,15 @@ func getCloud(userID string) (*xiaomi.Cloud, error) {
+ }
+ 
+ func cloudRequest(userID, region, apiURL, params string) ([]byte, error) {
++	return cloudRequestContext(context.Background(), userID, region, apiURL, params)
++}
++
++func cloudRequestContext(ctx context.Context, userID, region, apiURL, params string) ([]byte, error) {
+ 	cloud, err := getCloud(userID)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	return cloud.Request(GetBaseURL(region), apiURL, params, nil)
++	return cloud.RequestWithContext(ctx, GetBaseURL(region), apiURL, params, nil)
+ }
+ 
+ func cloudUserRequest(user *url.Userinfo, apiURL, params string) ([]byte, error) {
+@@ -244,32 +250,30 @@ func apiDeviceList(w http.ResponseWriter, r *http.Request) {
+ 
+ 	err := func() error {
+ 		region := query.Get("region")
+-		res, err := cloudRequest(user, region, "/v2/home/device_list_page", "{}")
+-		if err != nil {
+-			return err
+-		}
+-		var v struct {
+-			List []*Device `json:"list"`
+-		}
++		ctx, cancel := context.WithTimeout(r.Context(), catalogRequestTimeout)
++		defer cancel()
+ 
+-		if err = json.Unmarshal(res, &v); err != nil {
++		devices, err := loadDevicePages(ctx, user, func(ctx context.Context, apiURL, params string) ([]byte, error) {
++			return cloudRequestContext(ctx, user, region, apiURL, params)
++		})
++		if err != nil {
+ 			return err
+ 		}
+ 
+ 		var items []*api.Source
+ 
+-		for _, device := range v.List {
+-			if !strings.Contains(device.Model, ".camera.") && !strings.Contains(device.Model, ".cateye.") {
+-				continue
+-			}
++		for _, device := range devices {
+ 			items = append(items, &api.Source{
++				ID:   string(device.Did),
+ 				Name: device.Name,
+ 				Info: fmt.Sprintf("ip: %s, mac: %s", device.IP, device.MAC),
+ 				URL:  fmt.Sprintf("xiaomi://%s:%s@%s?did=%s&model=%s", user, region, device.IP, device.Did, device.Model),
+ 			})
+ 		}
+ 
+-		api.ResponseSources(w, items)
++		api.ResponseJSON(w, struct {
++			Sources []*api.Source `json:"sources"`
++		}{Sources: items})
+ 		return nil
+ 	}()
+ 
+@@ -278,12 +282,199 @@ func apiDeviceList(w http.ResponseWriter, r *http.Request) {
+ 	}
+ }
+ 
++const catalogRequestTimeout = 45 * time.Second
++
++var errCatalogIncomplete = errors.New("xiaomi: catalog incomplete")
++
++type catalogRequestFunc func(context.Context, string, string) ([]byte, error)
++
++func loadDevicePages(ctx context.Context, userID string, request catalogRequestFunc) ([]*Device, error) {
++	if ctx == nil || !isDecimalID(userID) || request == nil {
++		return nil, errCatalogIncomplete
++	}
++
++	ownerID := xiaomiValue(userID)
++	devices := make([]*Device, 0)
++	byDID := make(map[xiaomiValue]*Device)
++	seenCursors := make(map[xiaomiValue]struct{})
++	var cursor xiaomiValue
++
++	for {
++		if err := ctx.Err(); err != nil {
++			return nil, fmt.Errorf("%w: deadline", errCatalogIncomplete)
++		}
++
++		params := "{}"
++		if cursor != "" {
++			encoded, err := json.Marshal(struct {
++				StartDID string `json:"start_did"`
++			}{StartDID: string(cursor)})
++			if err != nil {
++				return nil, fmt.Errorf("%w: device cursor", errCatalogIncomplete)
++			}
++			params = string(encoded)
++		}
++		body, err := request(ctx, "/v2/home/device_list_page", params)
++		if err != nil {
++			return nil, err
++		}
++
++		var page struct {
++			List         json.RawMessage `json:"list"`
++			HasMore      bool            `json:"has_more"`
++			NextStartDID json.RawMessage `json:"next_start_did"`
++		}
++		if err = json.Unmarshal(body, &page); err != nil || len(page.List) == 0 {
++			return nil, fmt.Errorf("%w: device page", errCatalogIncomplete)
++		}
++
++		var pageDevices []*Device
++		if string(page.List) == "null" {
++			if page.HasMore {
++				return nil, fmt.Errorf("%w: non-terminal null device list", errCatalogIncomplete)
++			}
++			pageDevices = make([]*Device, 0)
++		} else if err = json.Unmarshal(page.List, &pageDevices); err != nil || pageDevices == nil {
++			return nil, fmt.Errorf("%w: device list", errCatalogIncomplete)
++		}
++
++		for _, device := range pageDevices {
++			if device == nil || device.Did == "" {
++				return nil, fmt.Errorf("%w: device", errCatalogIncomplete)
++			}
++			if !isCameraModel(device.Model) {
++				continue
++			}
++			if !isDecimalID(string(device.Did)) {
++				return nil, fmt.Errorf("%w: camera id", errCatalogIncomplete)
++			}
++			deviceOwnerID, parseErr := parseOwnerID(device.UID)
++			if parseErr != nil {
++				return nil, fmt.Errorf("%w: camera owner", errCatalogIncomplete)
++			}
++			if deviceOwnerID != ownerID {
++				continue
++			}
++			if previous := byDID[device.Did]; previous != nil {
++				if !sameDevice(previous, device) {
++					return nil, fmt.Errorf("%w: conflicting device", errCatalogIncomplete)
++				}
++				continue
++			}
++			byDID[device.Did] = device
++			devices = append(devices, device)
++		}
++
++		if !page.HasMore {
++			return devices, nil
++		}
++		next, err := parseXiaomiValue(page.NextStartDID)
++		if err != nil || next == "" {
++			return nil, fmt.Errorf("%w: device cursor", errCatalogIncomplete)
++		}
++		if _, exists := seenCursors[next]; exists || cursor != "" && next == cursor {
++			return nil, fmt.Errorf("%w: device cursor did not advance", errCatalogIncomplete)
++		}
++		seenCursors[next] = struct{}{}
++		cursor = next
++	}
++}
++
++func parseOwnerID(data json.RawMessage) (xiaomiValue, error) {
++	if len(data) == 0 || string(data) == "null" {
++		return "", nil
++	}
++	if data[0] == '"' {
++		var value string
++		if err := json.Unmarshal(data, &value); err != nil {
++			return "", errCatalogIncomplete
++		}
++		return xiaomiValue(value), nil
++	}
++	return parseXiaomiValue(data)
++}
++
++var cameraAllowlistWifispeaker = map[string]struct{}{
++	"xiaomi.wifispeaker.oh11": {},
++	"xiaomi.wifispeaker.x6a":  {},
++	"xiaomi.wifispeaker.x10a": {},
++	"xiaomi.wifispeaker.oh8":  {},
++	"xiaomi.wifispeaker.x8f":  {},
++}
++
++var cameraAllowlistController = map[string]struct{}{
++	"xiaomi.controller.oh10p": {},
++}
++
++func isCameraModel(model string) bool {
++	if strings.Contains(model, ".camera.") || strings.Contains(model, ".cateye.") {
++		return true
++	}
++
++	if _, ok := cameraAllowlistWifispeaker[model]; ok {
++		return true
++	}
++	if _, ok := cameraAllowlistController[model]; ok {
++		return true
++	}
++	return false
++}
++
++func sameDevice(a, b *Device) bool {
++	return a.Did == b.Did && a.Name == b.Name && a.Model == b.Model && a.MAC == b.MAC && a.IP == b.IP
++}
++
++type xiaomiValue string
++
++func (id *xiaomiValue) UnmarshalJSON(data []byte) error {
++	value, err := parseXiaomiValue(data)
++	if err != nil {
++		return err
++	}
++	*id = value
++	return nil
++}
++
++func parseXiaomiValue(data []byte) (xiaomiValue, error) {
++	if len(data) == 0 || string(data) == "null" {
++		return "", errCatalogIncomplete
++	}
++	var value string
++	if data[0] == '"' {
++		if err := json.Unmarshal(data, &value); err != nil {
++			return "", errCatalogIncomplete
++		}
++	} else {
++		value = string(data)
++	}
++	if value == "" {
++		return "", errCatalogIncomplete
++	}
++	if data[0] != '"' && !isDecimalID(value) {
++		return "", errCatalogIncomplete
++	}
++	return xiaomiValue(value), nil
++}
++
++func isDecimalID(value string) bool {
++	if value == "" {
++		return false
++	}
++	for _, digit := range value {
++		if digit < '0' || digit > '9' {
++			return false
++		}
++	}
++	return true
++}
++
+ type Device struct {
+-	Did   string `json:"did"`
+-	Name  string `json:"name"`
+-	Model string `json:"model"`
+-	MAC   string `json:"mac"`
+-	IP    string `json:"localip"`
++	Did   xiaomiValue     `json:"did"`
++	UID   json.RawMessage `json:"uid"`
++	Name  string          `json:"name"`
++	Model string          `json:"model"`
++	MAC   string          `json:"mac"`
++	IP    string          `json:"localip"`
+ }
+ 
+ var auth *xiaomi.Cloud
+diff --git a/pkg/xiaomi/cloud.go b/pkg/xiaomi/cloud.go
+index 0dcfd241417a9a756e282f555acd842bbe17f75f..f97c87124699386e10c6b8b71367332c70c92a70 100644
+--- a/pkg/xiaomi/cloud.go
++++ b/pkg/xiaomi/cloud.go
+@@ -2,6 +2,7 @@ package xiaomi
+ 
+ import (
+ 	"bytes"
++	"context"
+ 	"crypto/md5"
+ 	"crypto/rand"
+ 	"crypto/rc4"
+@@ -393,6 +394,10 @@ func (c *Cloud) UserToken() (string, string) {
+ }
+ 
+ func (c *Cloud) Request(baseURL, apiURL, params string, headers map[string]string) ([]byte, error) {
++	return c.RequestWithContext(context.Background(), baseURL, apiURL, params, headers)
++}
++
++func (c *Cloud) RequestWithContext(ctx context.Context, baseURL, apiURL, params string, headers map[string]string) ([]byte, error) {
+ 	form := url.Values{"data": {params}}
+ 
+ 	nonce := genNonce()
+@@ -416,7 +421,7 @@ func (c *Cloud) Request(baseURL, apiURL, params string, headers map[string]strin
+ 	// 4. add nonce
+ 	form.Set("_nonce", base64.StdEncoding.EncodeToString(nonce))
+ 
+-	req, err := http.NewRequest("POST", baseURL+apiURL, strings.NewReader(form.Encode()))
++	req, err := http.NewRequestWithContext(ctx, "POST", baseURL+apiURL, strings.NewReader(form.Encode()))
+ 	if err != nil {
+ 		return nil, err
+ 	}

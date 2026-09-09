@@ -1,0 +1,15 @@
+diff --git a/pkg/xiaomi/miss/cs2/conn.go b/pkg/xiaomi/miss/cs2/conn.go
+index 1bea07c..67f3d74 100644
+--- a/pkg/xiaomi/miss/cs2/conn.go
++++ b/pkg/xiaomi/miss/cs2/conn.go
+@@ -327 +327 @@ func (c *udpConn) Read(b []byte) (n int, err error) {
+-		if string(addr.IP) == string(c.addr.IP) || n >= 8 {
++		if sameIP(addr.IP, c.addr.IP) || n >= 8 {
+@@ -360 +360 @@ func (c *udpConn) WriteUntil(req []byte, ok func(res []byte) bool) ([]byte, erro
+-		if string(addr.IP) != string(c.addr.IP) || n < 16 {
++		if !sameIP(addr.IP, c.addr.IP) || n < 16 {
+@@ -370,0 +371,4 @@ func (c *udpConn) WriteUntil(req []byte, ok func(res []byte) bool) ([]byte, erro
++func sameIP(a, b net.IP) bool {
++	return a.Equal(b)
++}
++

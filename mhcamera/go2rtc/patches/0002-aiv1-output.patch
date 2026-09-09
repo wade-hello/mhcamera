@@ -1,0 +1,686 @@
+diff --git a/cmd/mhcamera-go2rtc/main.go b/cmd/mhcamera-go2rtc/main.go
+index e69de29..0ea6418 100644
+--- a/cmd/mhcamera-go2rtc/main.go
++++ b/cmd/mhcamera-go2rtc/main.go
+@@ -0,0 +1,22 @@
++package main
++
++import (
++	"github.com/AlexxIT/go2rtc/internal/camera"
++	"github.com/AlexxIT/go2rtc/internal/api"
++	"github.com/AlexxIT/go2rtc/internal/app"
++	"github.com/AlexxIT/go2rtc/internal/streams"
++	"github.com/AlexxIT/go2rtc/internal/xiaomi"
++	"github.com/AlexxIT/go2rtc/pkg/shell"
++)
++
++func main() {
++	app.Version = "1.9.14"
++	app.Init()
++	api.Init()
++	streams.Init()
++	xiaomi.Init()
++	if err := camera.Init(); err != nil {
++		app.Logger.Fatal().Err(err).Msg("camera init")
++	}
++	shell.RunUntilSignal()
++}
+diff --git a/internal/camera/consumer.go b/internal/camera/consumer.go
+index e69de29..c2d07e4 100644
+--- a/internal/camera/consumer.go
++++ b/internal/camera/consumer.go
+@@ -0,0 +1,386 @@
++package camera
++
++import (
++	"encoding/binary"
++	"errors"
++	"fmt"
++	"io"
++	"net"
++	"sync"
++	"sync/atomic"
++	"time"
++
++	"github.com/AlexxIT/go2rtc/pkg/core"
++	"github.com/AlexxIT/go2rtc/pkg/h264"
++	"github.com/AlexxIT/go2rtc/pkg/h265"
++	"github.com/pion/rtp"
++)
++
++var errUnsupportedTrack = errors.New("aiv1: unsupported track")
++
++type wireFrame struct {
++	codec    uint32
++	flags    uint32
++	epoch    uint64
++	sequence uint64
++	ptsUS    uint64
++	payload  []byte
++}
++
++type Stats struct {
++	InputFrames     uint64
++	InputBytes      uint64
++	InvalidAVCC     uint64
++	SourceGaps      uint64
++	ResyncStarted   uint64
++	ResyncCompleted uint64
++	SocketTimeouts  uint64
++	OutputFrames    uint64
++	OutputBytes     uint64
++	LastFrameAgeMS  uint64
++}
++
++type counters struct {
++	inputFrames     atomic.Uint64
++	inputBytes      atomic.Uint64
++	invalidAVCC     atomic.Uint64
++	sourceGaps      atomic.Uint64
++	resyncStarted   atomic.Uint64
++	resyncCompleted atomic.Uint64
++	socketTimeouts  atomic.Uint64
++	outputFrames    atomic.Uint64
++	outputBytes     atomic.Uint64
++	lastOutputUnix  atomic.Int64
++}
++
++type Consumer struct {
++	conn         net.Conn
++	epoch        uint64
++	writeTimeout time.Duration
++
++	mu            sync.Mutex
++	node          *core.Node
++	codec         uint32
++	repair        core.HandlerFunc
++	done          chan struct{}
++	closeOnce     sync.Once
++	terminal      bool
++	writeErr      error
++	needKeyframe  bool
++	discontinuity bool
++	sourceSeq     uint16
++	haveSourceSeq bool
++	outputSeq     uint64
++	lastTimestamp uint32
++	haveTimestamp bool
++	ptsTicks      uint64
++	stats         counters
++}
++
++func newConsumer(conn net.Conn, epoch uint64, writeTimeout time.Duration) *Consumer {
++	c := &Consumer{
++		conn:          conn,
++		epoch:         epoch,
++		writeTimeout:  writeTimeout,
++		done:          make(chan struct{}),
++		needKeyframe:  true,
++		discontinuity: true,
++	}
++	c.stats.resyncStarted.Store(1)
++	return c
++}
++
++func (c *Consumer) Stats() Stats {
++	var lastFrameAgeMS uint64
++	if lastOutputUnix := c.stats.lastOutputUnix.Load(); lastOutputUnix != 0 {
++		lastOutputUnixTime := time.Unix(0, lastOutputUnix)
++		if elapsed := time.Since(lastOutputUnixTime); elapsed > 0 {
++			lastFrameAgeMS = uint64(elapsed / time.Millisecond)
++		}
++	}
++	return Stats{
++		InputFrames:     c.stats.inputFrames.Load(),
++		InputBytes:      c.stats.inputBytes.Load(),
++		InvalidAVCC:     c.stats.invalidAVCC.Load(),
++		SourceGaps:      c.stats.sourceGaps.Load(),
++		ResyncStarted:   c.stats.resyncStarted.Load(),
++		ResyncCompleted: c.stats.resyncCompleted.Load(),
++		SocketTimeouts:  c.stats.socketTimeouts.Load(),
++		OutputFrames:    c.stats.outputFrames.Load(),
++		OutputBytes:     c.stats.outputBytes.Load(),
++		LastFrameAgeMS:  lastFrameAgeMS,
++	}
++}
++
++func (c *Consumer) GetMedias() []*core.Media {
++	return []*core.Media{{
++		Kind:      core.KindVideo,
++		Direction: core.DirectionSendonly,
++		Codecs: []*core.Codec{
++			{Name: core.CodecH264, ClockRate: 90000, PayloadType: core.PayloadTypeRAW},
++			{Name: core.CodecH265, ClockRate: 90000, PayloadType: core.PayloadTypeRAW},
++		},
++	}}
++}
++
++func (c *Consumer) AddTrack(media *core.Media, codec *core.Codec, track *core.Receiver) error {
++	if media == nil || media.Kind != core.KindVideo || codec == nil || track == nil ||
++		track.Codec == nil || track.Codec.PayloadType != core.PayloadTypeRAW || codec.Name != track.Codec.Name {
++		return errUnsupportedTrack
++	}
++
++	var codecID uint32
++	var repair func(*core.Codec, core.HandlerFunc) core.HandlerFunc
++	switch track.Codec.Name {
++	case core.CodecH264:
++		codecID = codecH264
++		repair = h264.RepairAVCC
++	case core.CodecH265:
++		codecID = codecH265
++		repair = h265.RepairAVCC
++	default:
++		return errUnsupportedTrack
++	}
++
++	c.mu.Lock()
++	if c.node != nil || c.epoch == 0 || c.terminal {
++		c.mu.Unlock()
++		return errUnsupportedTrack
++	}
++	c.codec = codecID
++	c.repair = repair(track.Codec, c.acceptRepaired)
++	if err := c.writeRecord(marshalHello(c.codec, c.epoch)); err != nil {
++		c.terminal = true
++		c.mu.Unlock()
++		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
++			c.stats.socketTimeouts.Add(1)
++		}
++		_ = c.Stop()
++		return fmt.Errorf("aiv1: write hello: %w", err)
++	}
++
++	node := &core.Node{Codec: track.Codec}
++	node.Input = c.acceptPacket
++	c.node = node
++	node.WithParent(&track.Node)
++	c.mu.Unlock()
++	return nil
++}
++
++func (c *Consumer) Stop() error {
++	c.closeOnce.Do(func() {
++		c.mu.Lock()
++		c.terminal = true
++		node := c.node
++		c.node = nil
++		close(c.done)
++		_ = c.conn.Close()
++		c.mu.Unlock()
++		if node != nil {
++			node.Close()
++		}
++	})
++	return nil
++}
++
++func (c *Consumer) acceptPacket(packet *rtp.Packet) {
++	if packet == nil {
++		return
++	}
++	c.stats.inputFrames.Add(1)
++	c.stats.inputBytes.Add(uint64(len(packet.Payload)))
++
++	c.mu.Lock()
++	if c.terminal {
++		c.mu.Unlock()
++		return
++	}
++
++	if len(packet.Payload) > maxPayloadSize {
++		c.stats.invalidAVCC.Add(1)
++		c.enterResyncLocked()
++		c.mu.Unlock()
++		return
++	}
++	if _, ok := inspectAVCC(c.codec, packet.Payload); !ok {
++		c.stats.invalidAVCC.Add(1)
++		c.enterResyncLocked()
++		c.mu.Unlock()
++		return
++	}
++	if c.haveSourceSeq && packet.SequenceNumber != c.sourceSeq+1 {
++		c.stats.sourceGaps.Add(1)
++		c.enterResyncLocked()
++	}
++	c.sourceSeq = packet.SequenceNumber
++	c.haveSourceSeq = true
++
++	c.writeErr = nil
++	clone := *packet
++	c.repair(&clone)
++	writeErr := c.writeErr
++	if writeErr != nil {
++		c.terminal = true
++	}
++	c.mu.Unlock()
++
++	if writeErr != nil {
++		if netErr, ok := writeErr.(net.Error); ok && netErr.Timeout() {
++			c.stats.socketTimeouts.Add(1)
++		}
++		_ = c.Stop()
++	}
++}
++
++func (c *Consumer) acceptRepaired(packet *rtp.Packet) {
++	info, ok := inspectAVCC(c.codec, packet.Payload)
++	if !ok || len(packet.Payload) > maxPayloadSize {
++		c.stats.invalidAVCC.Add(1)
++		c.enterResyncLocked()
++		return
++	}
++	wasResyncing := c.needKeyframe
++	if wasResyncing && (!info.keyframe || !info.completeParameterSets(c.codec)) {
++		return
++	}
++
++	flags := uint32(0)
++	if info.keyframe {
++		if !info.completeParameterSets(c.codec) {
++			c.enterResyncLocked()
++			return
++		}
++		flags |= flagKeyframe
++	}
++	if c.discontinuity {
++		flags |= flagDiscontinuity
++	}
++
++	frame := wireFrame{
++		codec:   c.codec,
++		flags:   flags,
++		epoch:   c.epoch,
++		ptsUS:   c.timestampUS(packet.Timestamp),
++		payload: packet.Payload,
++	}
++	c.outputSeq++
++	frame.sequence = c.outputSeq
++
++	header := marshalFrameHeader(&frame)
++	if err := c.writeFrame(header, frame.payload); err != nil {
++		c.writeErr = err
++		return
++	}
++	c.needKeyframe = false
++	c.discontinuity = false
++	if wasResyncing || frame.flags&flagDiscontinuity != 0 {
++		c.stats.resyncCompleted.Add(1)
++	}
++	c.stats.outputFrames.Add(1)
++	c.stats.outputBytes.Add(uint64(len(frame.payload)))
++	c.stats.lastOutputUnix.Store(time.Now().UnixNano())
++}
++
++func (c *Consumer) enterResyncLocked() {
++	if !c.needKeyframe {
++		c.stats.resyncStarted.Add(1)
++	}
++	c.needKeyframe = true
++	c.discontinuity = true
++}
++
++func (c *Consumer) timestampUS(timestamp uint32) uint64 {
++	if !c.haveTimestamp {
++		c.haveTimestamp = true
++		c.lastTimestamp = timestamp
++		return 1
++	}
++	c.ptsTicks += uint64(timestamp - c.lastTimestamp)
++	c.lastTimestamp = timestamp
++	return c.ptsTicks*protocolTimescale/90000 + 1
++}
++
++func (c *Consumer) writeRecord(record []byte) error {
++	if err := c.conn.SetWriteDeadline(time.Now().Add(c.writeTimeout)); err != nil {
++		return err
++	}
++	n, err := c.conn.Write(record)
++	if err == nil && n != len(record) {
++		err = io.ErrShortWrite
++	}
++	return err
++}
++
++func (c *Consumer) writeFrame(header, payload []byte) error {
++	if err := c.conn.SetWriteDeadline(time.Now().Add(c.writeTimeout)); err != nil {
++		return err
++	}
++	buffers := net.Buffers{header, payload}
++	n, err := buffers.WriteTo(c.conn)
++	if err == nil && n != int64(len(header)+len(payload)) {
++		err = io.ErrShortWrite
++	}
++	return err
++}
++
++type avccInfo struct {
++	keyframe bool
++	sps      bool
++	pps      bool
++	vps      bool
++}
++
++func (i avccInfo) completeParameterSets(codec uint32) bool {
++	if codec == codecH264 {
++		return i.sps && i.pps
++	}
++	return i.vps && i.sps && i.pps
++}
++
++func inspectAVCC(codec uint32, payload []byte) (avccInfo, bool) {
++	var info avccInfo
++	if len(payload) == 0 {
++		return info, false
++	}
++	for len(payload) != 0 {
++		if len(payload) < 4 {
++			return avccInfo{}, false
++		}
++		size := int(binary.BigEndian.Uint32(payload))
++		if size <= 0 || size > len(payload)-4 {
++			return avccInfo{}, false
++		}
++		nalu := payload[4 : 4+size]
++		if codec == codecH264 {
++			if len(nalu) < 1 || nalu[0]&0x80 != 0 {
++				return avccInfo{}, false
++			}
++			switch nalu[0] & 0x1f {
++			case h264.NALUTypeIFrame:
++				info.keyframe = true
++			case h264.NALUTypeSPS:
++				info.sps = true
++			case h264.NALUTypePPS:
++				info.pps = true
++			}
++		} else if codec == codecH265 {
++			if len(nalu) < 2 || nalu[0]&0x80 != 0 {
++				return avccInfo{}, false
++			}
++			switch (nalu[0] >> 1) & 0x3f {
++			case h265.NALUTypeIFrame, h265.NALUTypeIFrame2, h265.NALUTypeIFrame3:
++				info.keyframe = true
++			case h265.NALUTypeVPS:
++				info.vps = true
++			case h265.NALUTypeSPS:
++				info.sps = true
++			case h265.NALUTypePPS:
++				info.pps = true
++			}
++		} else {
++			return avccInfo{}, false
++		}
++		payload = payload[4+size:]
++	}
++	return info, true
++}
+diff --git a/internal/camera/protocol.go b/internal/camera/protocol.go
+index e69de29..d4898c4 100644
+--- a/internal/camera/protocol.go
++++ b/internal/camera/protocol.go
+@@ -0,0 +1,47 @@
++package camera
++
++import "encoding/binary"
++
++const (
++	helloMagic        = "AIVH"
++	frameMagic        = "AIVF"
++	protocolVersion   = 1
++	helloSize         = 32
++	frameHeaderSize   = 48
++	protocolTimescale = 1_000_000
++	maxPayloadSize    = 8 * 1024 * 1024
++
++	codecH264  = 1
++	codecH265  = 2
++	formatAVCC = 1
++
++	flagKeyframe      = 1 << 0
++	flagDiscontinuity = 1 << 1
++)
++
++func marshalHello(codec uint32, epoch uint64) []byte {
++	b := make([]byte, helloSize)
++	copy(b, helloMagic)
++	binary.LittleEndian.PutUint16(b[4:], protocolVersion)
++	binary.LittleEndian.PutUint16(b[6:], helloSize)
++	binary.LittleEndian.PutUint32(b[8:], codec)
++	binary.LittleEndian.PutUint32(b[12:], formatAVCC)
++	binary.LittleEndian.PutUint32(b[16:], protocolTimescale)
++	binary.LittleEndian.PutUint32(b[20:], maxPayloadSize)
++	binary.LittleEndian.PutUint64(b[24:], epoch)
++	return b
++}
++
++func marshalFrameHeader(frame *wireFrame) []byte {
++	b := make([]byte, frameHeaderSize)
++	copy(b, frameMagic)
++	binary.LittleEndian.PutUint16(b[4:], protocolVersion)
++	binary.LittleEndian.PutUint16(b[6:], frameHeaderSize)
++	binary.LittleEndian.PutUint32(b[8:], frame.codec)
++	binary.LittleEndian.PutUint32(b[12:], frame.flags)
++	binary.LittleEndian.PutUint64(b[16:], frame.epoch)
++	binary.LittleEndian.PutUint64(b[24:], frame.sequence)
++	binary.LittleEndian.PutUint64(b[32:], frame.ptsUS)
++	binary.LittleEndian.PutUint32(b[40:], uint32(len(frame.payload)))
++	return b
++}
+diff --git a/internal/camera/server.go b/internal/camera/server.go
+index e69de29..8d413b1 100644
+--- a/internal/camera/server.go
++++ b/internal/camera/server.go
+@@ -0,0 +1,211 @@
++package camera
++
++import (
++	"crypto/rand"
++	"encoding/binary"
++	"errors"
++	"fmt"
++	"net"
++	"os"
++	"path/filepath"
++	"sync"
++	"sync/atomic"
++	"syscall"
++	"time"
++
++	"github.com/AlexxIT/go2rtc/internal/app"
++	"github.com/AlexxIT/go2rtc/internal/streams"
++	"github.com/rs/zerolog"
++)
++
++const (
++	mediaSocketPath = "/data/plugins/mhcamera/tmp/go2rtc-media.sock"
++	frameWriteLimit = 50 * time.Millisecond
++)
++
++var log zerolog.Logger
++
++type Server struct {
++	listener    *net.UnixListener
++	expectedPID int32
++	active      atomic.Bool
++	closeOnce   sync.Once
++}
++
++func Init() error {
++	log = app.GetLogger("camera")
++	server, err := startServer(mediaSocketPath, int32(os.Getppid()))
++	if err != nil {
++		return err
++	}
++	go server.Serve()
++	return nil
++}
++
++func startServer(path string, expectedPID int32) (*Server, error) {
++	if expectedPID <= 0 {
++		return nil, errors.New("aiv1: invalid expected peer pid")
++	}
++	listener, err := listenPrivate(path)
++	if err != nil {
++		return nil, err
++	}
++	return &Server{listener: listener, expectedPID: expectedPID}, nil
++}
++
++func (s *Server) Serve() {
++	for {
++		conn, err := s.listener.AcceptUnix()
++		if err != nil {
++			return
++		}
++		if err = verifyPeer(conn, uint32(os.Geteuid()), s.expectedPID); err != nil ||
++			!s.active.CompareAndSwap(false, true) {
++			_ = conn.Close()
++			continue
++		}
++		go func() {
++			s.serveConn(conn)
++			s.active.Store(false)
++		}()
++	}
++}
++
++func (s *Server) Close() error {
++	var err error
++	s.closeOnce.Do(func() { err = s.listener.Close() })
++	return err
++}
++
++func (s *Server) serveConn(conn *net.UnixConn) {
++	epoch, err := randomEpoch()
++	if err != nil {
++		_ = conn.Close()
++		return
++	}
++	stream := streams.Get("selected")
++	if stream == nil {
++		_ = conn.Close()
++		return
++	}
++
++	consumer := newConsumer(conn, epoch, frameWriteLimit)
++	if err = stream.AddConsumer(consumer); err != nil {
++		_ = consumer.Stop()
++		logSession("attach_failed", consumer.Stats())
++		return
++	}
++
++	reason := make(chan string, 1)
++	go func() {
++		var one [1]byte
++		n, _ := conn.Read(one[:])
++		if n != 0 {
++			reason <- "client_input"
++		} else {
++			reason <- "peer_closed"
++		}
++		_ = consumer.Stop()
++	}()
++
++	why := "output_closed"
++	select {
++	case why = <-reason:
++	case <-consumer.done:
++	}
++	stream.RemoveConsumer(consumer)
++	logSession(why, consumer.Stats())
++}
++
++func logSession(reason string, stats Stats) {
++	log.Info().
++		Str("reason", reason).
++		Uint64("input_frames", stats.InputFrames).
++		Uint64("input_bytes", stats.InputBytes).
++		Uint64("invalid_avcc", stats.InvalidAVCC).
++		Uint64("source_gaps", stats.SourceGaps).
++		Uint64("resync_started", stats.ResyncStarted).
++		Uint64("resync_completed", stats.ResyncCompleted).
++		Uint64("socket_timeouts", stats.SocketTimeouts).
++		Uint64("output_frames", stats.OutputFrames).
++		Uint64("output_bytes", stats.OutputBytes).
++		Uint64("last_frame_age_ms", stats.LastFrameAgeMS).
++		Msg("aiv1 media session")
++}
++
++func randomEpoch() (uint64, error) {
++	var data [8]byte
++	for {
++		if _, err := rand.Read(data[:]); err != nil {
++			return 0, fmt.Errorf("aiv1: random epoch: %w", err)
++		}
++		if epoch := binary.LittleEndian.Uint64(data[:]); epoch != 0 {
++			return epoch, nil
++		}
++	}
++}
++
++func listenPrivate(path string) (*net.UnixListener, error) {
++	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
++		return nil, errors.New("aiv1: media socket path must be clean and absolute")
++	}
++	dir := filepath.Dir(path)
++	info, err := os.Lstat(dir)
++	if err != nil {
++		return nil, fmt.Errorf("aiv1: inspect media socket directory: %w", err)
++	}
++	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0700 ||
++		fileUID(info) != uint32(os.Geteuid()) {
++		return nil, errors.New("aiv1: media socket directory is not private")
++	}
++
++	if info, err = os.Lstat(path); err == nil {
++		if info.Mode()&os.ModeSocket == 0 || info.Mode()&os.ModeSymlink != 0 ||
++			fileUID(info) != uint32(os.Geteuid()) {
++			return nil, errors.New("aiv1: refusing to replace unsafe media socket path")
++		}
++		if err = os.Remove(path); err != nil {
++			return nil, fmt.Errorf("aiv1: remove stale media socket: %w", err)
++		}
++	} else if !errors.Is(err, os.ErrNotExist) {
++		return nil, fmt.Errorf("aiv1: inspect media socket: %w", err)
++	}
++
++	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
++	if err != nil {
++		return nil, fmt.Errorf("aiv1: listen media socket: %w", err)
++	}
++	if err = os.Chmod(path, 0600); err != nil {
++		_ = listener.Close()
++		return nil, fmt.Errorf("aiv1: protect media socket: %w", err)
++	}
++	return listener, nil
++}
++
++func fileUID(info os.FileInfo) uint32 {
++	if stat, ok := info.Sys().(*syscall.Stat_t); ok {
++		return stat.Uid
++	}
++	return ^uint32(0)
++}
++
++func verifyPeer(conn *net.UnixConn, expectedUID uint32, expectedPID int32) error {
++	raw, err := conn.SyscallConn()
++	if err != nil {
++		return err
++	}
++	var cred *syscall.Ucred
++	var sockErr error
++	if err = raw.Control(func(fd uintptr) {
++		cred, sockErr = syscall.GetsockoptUcred(int(fd), syscall.SOL_SOCKET, syscall.SO_PEERCRED)
++	}); err != nil {
++		return err
++	}
++	if sockErr != nil {
++		return sockErr
++	}
++	if cred == nil || cred.Uid != expectedUID || cred.Pid != expectedPID {
++		return errors.New("aiv1: unexpected media peer credentials")
++	}
++	return nil
++}

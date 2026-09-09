@@ -1,0 +1,56 @@
+GO2RTC_VERSION=v1.9.14
+GO2RTC_COMMIT=b5948cfb25404cc5cb37b166ecaa2dca20b11d4b
+GO2RTC_TARBALL_URL=https://codeload.github.com/AlexxIT/go2rtc/tar.gz/b5948cfb25404cc5cb37b166ecaa2dca20b11d4b
+GO2RTC_TARBALL_SHA256=78aa79bcedec8f155e4060a379613979b0b3ee48ff62ee5164bafc0ac6532386
+# Required only until the selected upstream contains the same canonical IPv4
+# comparison. On upgrade, check for an equivalent upstream fix first; if found,
+# remove this patch and both variables rather than keeping a conditional fallback.
+GO2RTC_CS2_IPV4_EQUALITY_PATCH=0001-cs2-ipv4-equality.patch
+GO2RTC_CS2_IPV4_EQUALITY_PATCH_SHA256=bebcff21900c50d6ebae910e6f5c275c0fd15287f37aca3fe13177b804bc1267
+# Add-only mhcamera product entry point and private ordered AIV1 AVCC Consumer.
+GO2RTC_AIV1_OUTPUT_PATCH=0002-aiv1-output.patch
+GO2RTC_AIV1_OUTPUT_PATCH_SHA256=bf94ae2a2eb3bb3693b022936db02656c11e1d6cc7e626b3d7f503169ffe40fb
+# Xiaomi Passport phone/SMS bootstrap: separate Passport CookieJar, EUI,
+# native XiaomiIO LoginWithToken handoff, and rotated-token persistence.
+GO2RTC_XIAOMI_PHONE_PATCH=0003-xiaomi-phone-bootstrap.patch
+GO2RTC_XIAOMI_PHONE_PATCH_SHA256=bef41cd6daa78b0d6feb88dcfaa83f458d6ebaead83b74b08d6ff5fa716db838
+# Complete Xiaomi device pagination with validated cursors, atomic snapshots,
+# and duplicate-camera conflict detection.
+GO2RTC_XIAOMI_DEVICE_PAGINATION_PATCH=0004-xiaomi-device-list-pagination.patch
+GO2RTC_XIAOMI_DEVICE_PAGINATION_PATCH_SHA256=48255b0317508098a9a08f5627d4906d1ae95cb70b4e18db27ab87ce6e807a74
+# Strict six-region, device-authoritative Xiaomi catalogs with optional atomic
+# home/room location enrichment.
+GO2RTC_XIAOMI_HOME_ROOM_PATCH=0005-xiaomi-home-room-metadata.patch
+GO2RTC_XIAOMI_HOME_ROOM_PATCH_SHA256=05d388cafc5bbd340fc14af72f3e49aee91a90dcf157d642fa97f4b46c1cfacc
+# Typed Xiaomi Cloud errors, single-flight session renewal, and atomic
+# persistence of rotated passToken credentials.
+GO2RTC_XIAOMI_SESSION_RENEWAL_PATCH=0006-xiaomi-cloud-session-renewal.patch
+GO2RTC_XIAOMI_SESSION_RENEWAL_PATCH_SHA256=4333f11f23d5962a650d2e2935b7f3ee984fe609554f4cbb63d3123396f43896
+# Drain post-login MISS command messages so the bounded CS2 command channel
+# cannot fill, and close the connection if the drain terminates on an error.
+GO2RTC_XIAOMI_CS2_COMMAND_DRAIN_PATCH=0007-xiaomi-cs2-command-drain.patch
+GO2RTC_XIAOMI_CS2_COMMAND_DRAIN_PATCH_SHA256=b3e0dcea3db248668b37b6060430175a9a8ca99d97651cc7f4bee866574fb39f
+GO2RTC_XIAOMI_CS2_COMMAND_DRAIN_UPSTREAM_PR=https://github.com/AlexxIT/go2rtc/pull/2280
+GO2RTC_XIAOMI_CS2_COMMAND_DRAIN_UPSTREAM_COMMIT=a71f29545c8ceefa4224b201d1d34ff937300fa8
+# Reviewed/adapted frame safety follow-up from the same upstream PR. The
+# product patch keeps the upstream 2 MiB reconstructed-record limit, preserves
+# invalid sizes in errors, and also guards short records at readers.
+GO2RTC_XIAOMI_CS2_FRAME_SAFETY_PATCH=0008-xiaomi-cs2-frame-safety.patch
+GO2RTC_XIAOMI_CS2_FRAME_SAFETY_PATCH_SHA256=f6d4e1e98f9783299b5d384eca600f90032104cf28e08e2a70baeeea61a7a839
+GO2RTC_XIAOMI_CS2_FRAME_SAFETY_UPSTREAM_PR=https://github.com/AlexxIT/go2rtc/pull/2280
+GO2RTC_XIAOMI_CS2_FRAME_SAFETY_UPSTREAM_COMMIT=929bc9c9405dfb3efc9197ec72e5389b530156f1
+# Distinguish the CS2 close request (0xF0) from its acknowledgment (0xF1).
+# Remove this patch when the selected upstream includes the same fix.
+GO2RTC_XIAOMI_CS2_CLOSE_MESSAGES_PATCH=0009-xiaomi-cs2-close-messages.patch
+GO2RTC_XIAOMI_CS2_CLOSE_MESSAGES_PATCH_SHA256=02fcae544e9fc26f8e2a57972676455fccc0cfa50b083c72032bbc571ac64b2a
+GO2RTC_XIAOMI_CS2_CLOSE_MESSAGES_UPSTREAM_URL=https://github.com/AlexxIT/go2rtc/commit/366cbd200d3b30bea9c7d88b36385d832cd245b2
+GO2RTC_XIAOMI_CS2_CLOSE_MESSAGES_UPSTREAM_COMMIT=366cbd200d3b30bea9c7d88b36385d832cd245b2
+# Independent cancellable Xiaomi source owner; video-only AIV1 and default-off
+# single-viewer RTSP/TCP share prepared video/audio tracks with generation-safe
+# teardown, typed capability/state, and bounded authenticated protocol handling.
+GO2RTC_CAMERA_SOURCE_RTSP_OUTPUT_PATCH=0010-camera-source-rtsp-output.patch
+GO2RTC_CAMERA_SOURCE_RTSP_OUTPUT_PATCH_SHA256=cc387f7ed6bb13f7153efbbb3dd72ce1d162f728e2ae95c5942ad5f159858e2f
+GO_VERSION=1.24.0
+GO_HOST_ARCHIVE_URL=https://go.dev/dl/go1.24.0.linux-amd64.tar.gz
+GO_HOST_ARCHIVE_SHA256=dea9ca38a0b852a74e81c26134671af7c0fbe65d81b0dc1c5bfe22cf7d4c8858
+SOURCE_DATE_EPOCH=1768813149

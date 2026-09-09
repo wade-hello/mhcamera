@@ -1,0 +1,13 @@
+cJSON 1.7.19 (MIT)
+===================
+
+The Mi Camera backend dynamically links libcjson.so.1 supplied by the AInice Vision
+host system. The plugin package does not redistribute the cJSON shared library.
+
+Upstream source:
+https://github.com/DaveGamble/cJSON/archive/refs/tags/v1.7.19.tar.gz
+
+Source archive SHA-256:
+7fa616e3046edfa7a28a32d5f9eacfd23f92900fe1f8ccd988c1662f30454562
+
+The accompanying LICENSE is the upstream cJSON v1.7.19 MIT license text.

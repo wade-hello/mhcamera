@@ -1,0 +1,2340 @@
+diff --git a/cmd/mhcamera-go2rtc/main.go b/cmd/mhcamera-go2rtc/main.go
+index 0ea6418..fd0af21 100644
+--- a/cmd/mhcamera-go2rtc/main.go
++++ b/cmd/mhcamera-go2rtc/main.go
+@@ -4,7 +4,6 @@ import (
+ 	"github.com/AlexxIT/go2rtc/internal/camera"
+ 	"github.com/AlexxIT/go2rtc/internal/api"
+ 	"github.com/AlexxIT/go2rtc/internal/app"
+-	"github.com/AlexxIT/go2rtc/internal/streams"
+ 	"github.com/AlexxIT/go2rtc/internal/xiaomi"
+ 	"github.com/AlexxIT/go2rtc/pkg/shell"
+ )
+@@ -13,10 +12,10 @@ func main() {
+ 	app.Version = "1.9.14"
+ 	app.Init()
+ 	api.Init()
+-	streams.Init()
+ 	xiaomi.Init()
+ 	if err := camera.Init(); err != nil {
+ 		app.Logger.Fatal().Err(err).Msg("camera init")
+ 	}
++	defer camera.Close()
+ 	shell.RunUntilSignal()
+ }
+diff --git a/internal/camera/rtsp.go b/internal/camera/rtsp.go
+index e69de29..895bb13 100644
+--- a/internal/camera/rtsp.go
++++ b/internal/camera/rtsp.go
+@@ -0,0 +1,282 @@
++package camera
++
++import (
++	"encoding/json"
++	"errors"
++	"io"
++	"net"
++	"net/http"
++	"strconv"
++	"strings"
++	"sync"
++	"time"
++
++	"github.com/AlexxIT/go2rtc/internal/api"
++	"github.com/AlexxIT/go2rtc/pkg/core"
++	"github.com/AlexxIT/go2rtc/pkg/rtsp"
++	"github.com/AlexxIT/go2rtc/pkg/tcp"
++)
++
++type rtspListenerState uint8
++
++const (
++	rtspServing rtspListenerState = iota
++	rtspClosing
++)
++
++type rtspSessionPhase uint8
++
++const (
++	rtspAccepted rtspSessionPhase = iota
++	rtspDescribed
++	rtspSetup
++	rtspPlaying
++)
++
++type rtspRun struct {
++	listener           net.Listener
++	source             *sourceOwner
++	username, password string
++	mu                 sync.Mutex
++	state              rtspListenerState
++	clients            map[net.Conn]struct{}
++	viewer             net.Conn // reserved only after authenticated DESCRIBE
++	wg                 sync.WaitGroup
++}
++
++type rtspControl struct {
++	mu      sync.Mutex // serializes listener/credential controls, never used by clients
++	address string
++	run     *rtspRun
++}
++
++func initRTSP() *rtspControl {
++	c := &rtspControl{address: ":8554"}
++	// The product owns this private endpoint; user YAML does not choose its API.
++	api.AllowPath("/api/camera/rtsp")
++	api.HandleFunc("api/camera/rtsp", c.handle)
++	return c
++}
++
++func (c *rtspControl) stop() {
++	if run := c.run; run != nil {
++		run.mu.Lock()
++		run.state = rtspClosing
++		_ = run.listener.Close()
++		for conn := range run.clients {
++			_ = conn.Close() // interrupt reads/writes without racing RTSP state fields
++		}
++		run.mu.Unlock()
++		run.wg.Wait() // all RTSP tracks detached before acknowledging disable
++		c.run = nil
++	}
++}
++
++func (c *rtspControl) configure(enabled bool, username, password string) error {
++	if !enabled {
++		c.stop()
++		return nil
++	}
++	if username != "viewer" || len(password) != 8 || strings.IndexFunc(password, func(r rune) bool { return !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9') }) >= 0 {
++		return errors.New("RTSP playback credentials are required")
++	}
++	if cameraSource == nil || cameraSource.snapshot().Source == "" {
++		return errors.New("selected camera has no source target")
++	}
++	if c.run != nil {
++		if c.run.username != username || c.run.password != password {
++			return errors.New("disable RTSP before changing credentials")
++		}
++		return nil
++	}
++	listener, err := net.Listen("tcp", c.address)
++	if err != nil {
++		return errors.New("RTSP port is unavailable")
++	}
++	run := &rtspRun{listener: listener, source: cameraSource, username: username,
++		password: password, clients: make(map[net.Conn]struct{})}
++	c.run = run
++	run.wg.Add(1)
++	go run.serve()
++	return nil
++}
++
++func (c *rtspControl) handle(w http.ResponseWriter, r *http.Request) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	switch r.Method {
++	case http.MethodPost:
++		var request struct {
++			Enabled  *bool  `json:"enabled"`
++			Username string `json:"username"`
++			Password string `json:"password"`
++		}
++		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
++		decoder.DisallowUnknownFields()
++		if decoder.Decode(&request) != nil || request.Enabled == nil || decoder.Decode(new(any)) != io.EOF {
++			http.Error(w, "invalid RTSP configuration", http.StatusBadRequest)
++			return
++		}
++		if err := c.configure(*request.Enabled, request.Username, request.Password); err != nil {
++			http.Error(w, err.Error(), http.StatusConflict)
++			return
++		}
++	case http.MethodGet:
++	default:
++		w.Header().Set("Allow", "GET, POST")
++		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
++		return
++	}
++	clients := 0
++	if c.run != nil {
++		c.run.mu.Lock()
++		if c.run.viewer != nil {
++			clients = 1
++		}
++		c.run.mu.Unlock()
++	}
++	source := sourceSnapshot{State: sourceStopped}
++	if cameraSource != nil {
++		source = cameraSource.snapshot()
++	}
++	api.ResponseJSON(w, map[string]any{"enabled": c.run != nil, "port": 8554, "path": "/stream", "clients": clients,
++		"source": source.Source, "source_state": source.State, "source_error": source.Error, "audio_known": source.AudioKnown, "audio_supported": source.AudioSupported})
++}
++
++func (run *rtspRun) serve() {
++	defer run.wg.Done()
++	for {
++		conn, err := run.listener.Accept()
++		if err != nil {
++			return
++		}
++		run.mu.Lock()
++		if run.state == rtspClosing {
++			_ = conn.Close()
++			run.mu.Unlock()
++			return
++		}
++		// Bind the source generation before publishing this accepted client.
++		// No delayed playback goroutine may reserve a replacement source.
++		reservation, err := run.source.reserve(func() { _ = conn.Close() })
++		if err != nil {
++			_ = conn.Close()
++			run.mu.Unlock()
++			continue
++		}
++		run.clients[conn] = struct{}{}
++		run.wg.Add(1)
++		run.mu.Unlock()
++		go run.play(conn, reservation)
++	}
++}
++
++func (run *rtspRun) play(raw net.Conn, reservation *sourceLease) {
++	defer run.wg.Done()
++	defer func() {
++		_ = raw.Close()
++		run.mu.Lock()
++		delete(run.clients, raw)
++		if run.viewer == raw {
++			run.viewer = nil
++		}
++		run.mu.Unlock()
++	}()
++	conn := rtsp.NewServer(raw)
++	defer reservation.close()
++	conn.Auth(run.username, run.password) // localhost also requires authentication
++	conn.SessionName = "Mi Camera"
++	phase := rtspAccepted
++	handshakeDeadline := time.Now().Add(10 * time.Second)
++	conn.ServerHandshakeDeadline = handshakeDeadline
++	conn.ServerRequestPolicy = func(req *tcp.Request) string {
++		if run.source.snapshot().Generation != reservation.generation {
++			return "503 Service Unavailable"
++		}
++		if req.URL == nil || req.URL.RawQuery != "" || req.URL.Fragment != "" {
++			return "404 Not Found"
++		}
++		path := req.URL.Path
++		if req.Method == rtsp.MethodSetup {
++			id, err := strconv.Atoi(strings.TrimPrefix(path, "/stream/trackID="))
++			if err != nil || id < 0 || id >= len(conn.Senders) || path != "/stream/trackID="+strconv.Itoa(id) {
++				return "404 Not Found"
++			}
++		} else if path != "/stream" && !(req.Method == rtsp.MethodOptions && path == "*") {
++			return "404 Not Found"
++		}
++		switch req.Method {
++		case rtsp.MethodOptions, rtsp.MethodTeardown:
++			return ""
++		case "GET_PARAMETER":
++			if phase == rtspPlaying {
++				return ""
++			}
++		case rtsp.MethodDescribe:
++			if phase == rtspAccepted {
++				if run.source.snapshot().State != sourceRunning {
++					return "503 Service Unavailable"
++				}
++				run.mu.Lock()
++				defer run.mu.Unlock()
++				if run.state == rtspClosing {
++					return "503 Service Unavailable"
++				}
++				if run.viewer != nil {
++					return "453 Not Enough Bandwidth"
++				}
++				run.viewer = raw
++				return ""
++			}
++		case rtsp.MethodSetup:
++			if phase == rtspDescribed || phase == rtspSetup {
++				if strings.HasPrefix(req.Header.Get("Transport"), "RTP/AVP/TCP") {
++					phase = rtspSetup
++				}
++				return ""
++			}
++		case rtsp.MethodPlay:
++			if phase == rtspSetup {
++				phase = rtspPlaying
++				return ""
++			}
++		default:
++			return "405 Method Not Allowed"
++		}
++		return "455 Method Not Valid in This State"
++	}
++	attached := false
++	var lease *sourceLease
++	defer func() {
++		if attached {
++			lease.close()
++		} else {
++			_ = conn.Stop()
++		}
++		// Draining an already closed socket cannot block on network progress.
++		for _, sender := range conn.Senders {
++			sender.Wait()
++		}
++	}()
++	conn.Listen(func(msg any) {
++		if msg != rtsp.MethodDescribe {
++			return
++		}
++		phase = rtspDescribed
++		conn.Medias = []*core.Media{
++			{Kind: core.KindVideo, Direction: core.DirectionSendonly, Codecs: []*core.Codec{{Name: core.CodecH264}, {Name: core.CodecH265}}},
++			{Kind: core.KindAudio, Direction: core.DirectionSendonly, Codecs: []*core.Codec{{Name: core.CodecPCMA}, {Name: core.CodecOpus}}},
++		}
++		run.mu.Lock()
++		defer run.mu.Unlock()
++		if run.state == rtspServing {
++			var err error
++			lease, err = run.source.attach(reservation.generation, conn, true, func() { _ = raw.Close() })
++			attached = err == nil
++		}
++	})
++	if err := conn.Accept(); err == nil && attached && phase == rtspPlaying {
++		_ = conn.Handle()
++	}
++	_ = raw.Close()
++}
+diff --git a/internal/camera/server.go b/internal/camera/server.go
+index 6b19b3d..0769448 100644
+--- a/internal/camera/server.go
++++ b/internal/camera/server.go
+@@ -14,7 +14,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/AlexxIT/go2rtc/internal/app"
+-	"github.com/AlexxIT/go2rtc/internal/streams"
++	"github.com/AlexxIT/go2rtc/internal/xiaomi"
+ 	"github.com/rs/zerolog"
+ )
+ 
+@@ -24,6 +24,9 @@ const (
+ )
+ 
+ var log zerolog.Logger
++var cameraSource *sourceOwner
++var productServer *Server
++var productRTSP *rtspControl
+ 
+ type Server struct {
+ 	listener    *net.UnixListener
+@@ -34,14 +37,33 @@ type Server struct {
+ 
+ func Init() error {
+ 	log = app.GetLogger("camera")
++	cameraSource = newSourceOwner(xiaomi.OpenSource)
+ 	server, err := startServer(mediaSocketPath, int32(os.Getppid()))
+ 	if err != nil {
++		cameraSource.close()
+ 		return err
+ 	}
++	productServer = server
+ 	go server.Serve()
++	initSourceAPI(cameraSource)
++	productRTSP = initRTSP()
+ 	return nil
+ }
+ 
++func Close() {
++	if productRTSP != nil {
++		productRTSP.mu.Lock()
++		productRTSP.stop()
++		productRTSP.mu.Unlock()
++	}
++	if productServer != nil {
++		_ = productServer.Close()
++	}
++	if cameraSource != nil {
++		cameraSource.close()
++	}
++}
++
+ func startServer(path string, expectedPID int32) (*Server, error) {
+ 	if expectedPID <= 0 {
+ 		return nil, errors.New("aiv1: invalid expected peer pid")
+@@ -83,14 +105,14 @@ func (s *Server) serveConn(conn *net.UnixConn) {
+ 		_ = conn.Close()
+ 		return
+ 	}
+-	stream := streams.Get("selected")
+-	if stream == nil {
++	if cameraSource == nil {
+ 		_ = conn.Close()
+ 		return
+ 	}
+ 
+ 	consumer := newConsumer(conn, epoch, frameWriteLimit)
+-	if err = stream.AddConsumer(consumer); err != nil {
++	lease, err := cameraSource.attach(cameraSource.snapshot().Generation, consumer, false, func() { _ = conn.Close() })
++	if err != nil {
+ 		_ = consumer.Stop()
+ 		logSession("attach_failed", consumer.Stats())
+ 		return
+@@ -113,7 +135,7 @@ func (s *Server) serveConn(conn *net.UnixConn) {
+ 	case why = <-reason:
+ 	case <-consumer.done:
+ 	}
+-	stream.RemoveConsumer(consumer)
++	lease.close()
+ 	logSession(why, consumer.Stats())
+ }
+ 
+diff --git a/internal/camera/source.go b/internal/camera/source.go
+index e69de29..f48a789 100644
+--- a/internal/camera/source.go
++++ b/internal/camera/source.go
+@@ -0,0 +1,301 @@
++package camera
++
++import (
++	"context"
++	"errors"
++	"sync"
++	"time"
++
++	"github.com/AlexxIT/go2rtc/pkg/core"
++	"github.com/AlexxIT/go2rtc/pkg/xiaomi"
++)
++
++type sourceFactory func(context.Context, string, func(bool)) (core.PreparedProducer, error)
++type sourceState string
++
++const (
++	sourceStopped  sourceState = "stopped"
++	sourceStarting sourceState = "starting"
++	sourceRunning  sourceState = "running"
++	sourceRetrying sourceState = "retrying"
++	sourceStopping sourceState = "stopping"
++	sourceFailed   sourceState = "error"
++)
++
++type sourceFailure string
++
++const (
++	sourceDialFailed         sourceFailure = "source_dial_failed"
++	sourceReadFailed         sourceFailure = "source_read_failed"
++	sourceAudioUnavailable   sourceFailure = "audio_unavailable"
++	sourceCredentialRejected sourceFailure = "credential_rejected"
++)
++
++type sourceSnapshot struct {
++	Source         string         `json:"source"`
++	Generation     uint64         `json:"generation"`
++	State          sourceState    `json:"state"`
++	AudioKnown     bool           `json:"audio_known"`
++	AudioSupported bool           `json:"audio_supported"`
++	Error          *sourceFailure `json:"error"`
++}
++
++// One worker owns the complete resolve/dial/read/retry chain. Controls replace
++// only the latest target; an obsolete attempt must exit before another dials.
++type sourceOwner struct {
++	op       sync.Mutex
++	mu       sync.Mutex
++	status   sourceSnapshot
++	factory  sourceFactory
++	cancel   context.CancelFunc
++	producer core.PreparedProducer
++	leases   map[*sourceLease]struct{}
++	wake     chan struct{}
++	done     chan struct{}
++	closed   bool
++}
++type sourceLease struct {
++	owner          *sourceOwner
++	generation     uint64
++	consumer       core.Consumer
++	once           sync.Once
++	closeTransport func()
++}
++
++func newSourceOwner(factory sourceFactory) *sourceOwner {
++	o := &sourceOwner{factory: factory, status: sourceSnapshot{State: sourceStopped}, leases: make(map[*sourceLease]struct{}), wake: make(chan struct{}, 1), done: make(chan struct{})}
++	go o.worker()
++	return o
++}
++func (o *sourceOwner) snapshot() sourceSnapshot { o.mu.Lock(); defer o.mu.Unlock(); return o.status }
++func (o *sourceOwner) signal() {
++	select {
++	case o.wake <- struct{}{}:
++	default:
++	}
++}
++func (o *sourceOwner) set(source string) (sourceSnapshot, bool) {
++	o.op.Lock()
++	defer o.op.Unlock()
++	o.mu.Lock()
++	if o.status.Source == source || o.closed {
++		s := o.status
++		o.mu.Unlock()
++		return s, false
++	}
++	oldGeneration := o.status.Generation
++	o.status = sourceSnapshot{Source: source, Generation: oldGeneration + 1, State: sourceStarting}
++	if source == "" {
++		o.status.State = sourceStopping
++		if o.cancel == nil {
++			o.status.State = sourceStopped
++		}
++	}
++	if o.cancel != nil {
++		o.cancel()
++	}
++	o.producer = nil // closes the attach gate before retiring any track
++	leases := o.takeLeasesLocked(oldGeneration)
++	o.mu.Unlock()
++	for _, lease := range leases {
++		lease.close()
++	}
++	log.Info().Str("event", "camera_source_target").Uint64("generation", oldGeneration+1).Bool("enabled", source != "").Msg("camera source target accepted")
++	o.signal()
++	return o.snapshot(), true
++}
++func (o *sourceOwner) close() {
++	o.set("")
++	o.mu.Lock()
++	o.closed = true
++	if o.cancel != nil {
++		o.cancel()
++	}
++	o.mu.Unlock()
++	o.signal()
++	<-o.done
++}
++func (o *sourceOwner) takeLeasesLocked(generation uint64) []*sourceLease {
++	leases := make([]*sourceLease, 0, len(o.leases))
++	for lease := range o.leases {
++		if lease.generation == generation {
++			leases = append(leases, lease)
++			delete(o.leases, lease)
++		}
++	}
++	return leases
++}
++func (l *sourceLease) close() {
++	l.once.Do(func() {
++		if l.closeTransport != nil {
++			l.closeTransport()
++		}
++		if l.consumer != nil {
++			_ = l.consumer.Stop()
++		}
++	})
++	l.owner.mu.Lock()
++	delete(l.owner.leases, l)
++	l.owner.mu.Unlock()
++}
++func (o *sourceOwner) reserve(closeTransport func()) (*sourceLease, error) {
++	o.mu.Lock()
++	defer o.mu.Unlock()
++	if o.status.Source == "" {
++		return nil, errors.New("camera source has no target")
++	}
++	l := &sourceLease{owner: o, generation: o.status.Generation, closeTransport: closeTransport}
++	o.leases[l] = struct{}{}
++	return l, nil
++}
++
++func (o *sourceOwner) attach(generation uint64, cons core.Consumer, audio bool, closeTransport func()) (*sourceLease, error) {
++	o.mu.Lock()
++	defer o.mu.Unlock()
++	if generation != o.status.Generation || o.producer == nil || o.status.State != sourceRunning {
++		return nil, errors.New("camera source is not ready")
++	}
++	l := &sourceLease{owner: o, generation: generation, consumer: cons, closeTransport: closeTransport}
++	for _, track := range o.producer.PreparedReceivers() {
++		if track.Media.Kind == core.KindAudio && !audio {
++			continue
++		}
++		var media *core.Media
++		var codec *core.Codec
++		for _, candidate := range cons.GetMedias() {
++			if candidate.Direction != core.DirectionSendonly || candidate.Kind != track.Media.Kind {
++				continue
++			}
++			for _, c := range candidate.Codecs {
++				if track.Codec.Match(c) {
++					media, codec = candidate, c
++					break
++				}
++			}
++			if codec != nil {
++				break
++			}
++		}
++		if codec == nil {
++			return nil, errors.New("camera codec is not supported")
++		}
++		if err := cons.AddTrack(media, codec, track); err != nil {
++			return nil, err
++		}
++	}
++	o.leases[l] = struct{}{}
++	return l, nil
++}
++func (o *sourceOwner) worker() {
++	defer close(o.done)
++	for {
++		o.mu.Lock()
++		if o.closed {
++			o.mu.Unlock()
++			return
++		}
++		select {
++		case <-o.wake:
++		default:
++		}
++		source, generation := o.status.Source, o.status.Generation
++		if source == "" {
++			o.status.State = sourceStopped
++			o.cancel = nil
++			o.mu.Unlock()
++			<-o.wake
++			continue
++		}
++		ctx, cancel := context.WithCancel(context.Background())
++		o.cancel = cancel
++		o.status.State = sourceStarting
++		o.mu.Unlock()
++		p, err := o.factory(ctx, source, func(supported bool) {
++			o.mu.Lock()
++			if o.status.Generation == generation && ctx.Err() == nil {
++				o.status.AudioKnown = true
++				o.status.AudioSupported = supported
++			}
++			o.mu.Unlock()
++		})
++		var stopOnce sync.Once
++		stop := func() {
++			if p != nil {
++				stopOnce.Do(func() { _ = p.Stop() })
++			}
++		}
++		var stopCancellation func() bool
++		if p != nil {
++			stopCancellation = context.AfterFunc(ctx, stop)
++		}
++		reading := false
++		if err == nil {
++			o.mu.Lock()
++			if o.status.Generation == generation && ctx.Err() == nil {
++				o.producer = p
++				o.status.State = sourceRunning
++				o.status.Error = nil
++				reading = true
++			}
++			o.mu.Unlock()
++			if reading {
++				log.Info().Str("event", "camera_source_running").Uint64("generation", generation).Msg("camera source prepared")
++				err = p.Start()
++			}
++		}
++		o.mu.Lock()
++		current := o.status.Generation == generation && ctx.Err() == nil
++		if current {
++			o.producer = nil
++			o.status.State = sourceRetrying
++		}
++		leases := o.takeLeasesLocked(generation)
++		o.mu.Unlock()
++		for _, lease := range leases {
++			lease.close()
++		}
++		// Interrupt underlying socket/command I/O before invoking Stop. This
++		// also applies to read failures, not only explicit target cancellation.
++		cancel()
++		stop()
++		if stopCancellation != nil {
++			stopCancellation()
++		}
++		o.mu.Lock()
++		if o.status.Generation != generation {
++			o.cancel = nil
++			o.mu.Unlock()
++			continue
++		}
++		o.cancel = nil
++		key := sourceError(err, reading)
++		o.status.Error = &key
++		terminal := key == sourceCredentialRejected
++		if terminal {
++			o.status.State = sourceFailed
++		}
++		o.mu.Unlock()
++		log.Warn().Str("event", "camera_source_failed").Uint64("generation", generation).Str("reason", string(key)).Msg("camera source stopped")
++		if terminal {
++			<-o.wake
++		} else {
++			select {
++			case <-o.wake:
++			case <-time.After(time.Second):
++			}
++		}
++	}
++}
++func sourceError(err error, reading bool) sourceFailure {
++	var cloudErr *xiaomi.CloudError
++	if errors.As(err, &cloudErr) && cloudErr.Kind == xiaomi.CloudErrorCredentialRejected {
++		return sourceCredentialRejected
++	}
++	if errors.Is(err, core.ErrNoAudio) {
++		return sourceAudioUnavailable
++	}
++	if reading {
++		return sourceReadFailed
++	}
++	return sourceDialFailed
++}
+diff --git a/internal/camera/source_api.go b/internal/camera/source_api.go
+index e69de29..042c814 100644
+--- a/internal/camera/source_api.go
++++ b/internal/camera/source_api.go
+@@ -0,0 +1,66 @@
++package camera
++
++import (
++	"encoding/json"
++	"io"
++	"net/http"
++	"net/url"
++
++	"github.com/AlexxIT/go2rtc/internal/api"
++)
++
++func (o *sourceOwner) handle(w http.ResponseWriter, r *http.Request) {
++	w.Header().Set("Cache-Control", "no-store")
++	if r.URL.RawQuery != "" {
++		http.Error(w, "query is not supported", http.StatusBadRequest)
++		return
++	}
++	status := http.StatusOK
++	var snapshot sourceSnapshot
++	switch r.Method {
++	case http.MethodGet:
++		snapshot = o.snapshot()
++	case http.MethodPost:
++		var request struct {
++			Source string `json:"source"`
++		}
++		d := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
++		d.DisallowUnknownFields()
++		if d.Decode(&request) != nil || d.Decode(new(any)) != io.EOF {
++			http.Error(w, "invalid source target", http.StatusBadRequest)
++			return
++		}
++		u, err := url.Parse(request.Source)
++		if err != nil || u.Scheme != "xiaomi" || u.Host == "" || u.Fragment != "" {
++			http.Error(w, "invalid source target", http.StatusBadRequest)
++			return
++		}
++		var changed bool
++		snapshot, changed = o.set(request.Source)
++		if changed || snapshot.State != sourceRunning {
++			status = http.StatusAccepted
++		}
++	case http.MethodDelete:
++		var b [1]byte
++		if n, _ := r.Body.Read(b[:]); n != 0 {
++			http.Error(w, "DELETE body is not supported", http.StatusBadRequest)
++			return
++		}
++		snapshot, _ = o.set("")
++		if snapshot.State != sourceStopped {
++			status = http.StatusAccepted
++		}
++	default:
++		w.Header().Set("Allow", "GET, POST, DELETE")
++		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
++		return
++	}
++	w.Header().Set("Content-Type", "application/json")
++	w.WriteHeader(status)
++	_ = json.NewEncoder(w).Encode(snapshot)
++}
++
++func initSourceAPI(o *sourceOwner) {
++	api.AllowPath("/api/camera/source")
++	api.HandleFunc("api/camera/source", o.handle)
++}
+diff --git a/internal/api/api.go b/internal/api/api.go
+index dfb6511..05c5c8c 100644
+--- a/internal/api/api.go
++++ b/internal/api/api.go
+@@ -150,6 +150,13 @@ const (
+ 
+ var Handler http.Handler
+ 
++// AllowPath is used by fixed product modules before registering private endpoints.
++func AllowPath(path string) {
++	if allowPaths != nil && !slices.Contains(allowPaths, path) {
++		allowPaths = append(allowPaths, path)
++	}
++}
++
+ // HandleFunc handle pattern with relative path:
+ // - "api/streams" => "{basepath}/api/streams"
+ // - "/streams"    => "/streams"
+diff --git a/internal/xiaomi/xiaomi.go b/internal/xiaomi/xiaomi.go
+index 5e018fe..47a62c6 100644
+--- a/internal/xiaomi/xiaomi.go
++++ b/internal/xiaomi/xiaomi.go
+@@ -14,7 +14,6 @@ import (
+ 
+ 	"github.com/AlexxIT/go2rtc/internal/api"
+ 	"github.com/AlexxIT/go2rtc/internal/app"
+-	"github.com/AlexxIT/go2rtc/internal/streams"
+ 	"github.com/AlexxIT/go2rtc/pkg/core"
+ 	"github.com/AlexxIT/go2rtc/pkg/xiaomi"
+ 	"github.com/AlexxIT/go2rtc/pkg/xiaomi/crypto"
+@@ -32,26 +31,27 @@ func Init() {
+ 	log := app.GetLogger("xiaomi")
+ 	cloudLog = log
+ 
+-	streams.HandleFunc("xiaomi", func(rawURL string) (core.Producer, error) {
+-		u, err := url.Parse(rawURL)
++	api.HandleFunc("api/xiaomi", apiXiaomi)
++	api.HandleFunc("api/xiaomi-phone", xiaomiPhoneAuth.serveHTTP)
++}
++
++// OpenSource resolves one requested source with cancellable cloud/P2P I/O.
++// Its caller, not a viewer or a stream registry, owns retries and lifetime.
++func OpenSource(ctx context.Context, rawURL string, report func(bool)) (core.PreparedProducer, error) {
++	u, err := url.Parse(rawURL)
++	if err != nil {
++		return nil, err
++	}
++	if u.User != nil {
++		rawURL, err = getCameraURLContext(ctx, u)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+-
+-		if u.User != nil {
+-			rawURL, err = getCameraURL(u)
+-			if err != nil {
+-				return nil, err
+-			}
+-		}
+-
+-		log.Debug().Msgf("xiaomi: dial %s", rawURL)
+-
+-		return xiaomi.Dial(rawURL)
+-	})
+-
+-	api.HandleFunc("api/xiaomi", apiXiaomi)
+-	api.HandleFunc("api/xiaomi-phone", xiaomiPhoneAuth.serveHTTP)
++	}
++	if err = ctx.Err(); err != nil {
++		return nil, err
++	}
++	return xiaomi.DialContext(ctx, rawURL, report)
+ }
+ 
+ var tokens map[string]string
+@@ -61,9 +61,9 @@ var cloudsMu sync.Mutex
+ var xiaomiPhoneAuth = newPhoneBootstrap(phoneDependencies{})
+ var cloudLog = zerolog.Nop()
+ 
+-var authenticateCloudToken = func(userID, passToken string) (*xiaomi.Cloud, string, string, error) {
++var authenticateCloudToken = func(ctx context.Context, userID, passToken string) (*xiaomi.Cloud, string, string, error) {
+ 	cloud := xiaomi.NewCloud(AppXiaomiHome)
+-	if err := cloud.LoginWithToken(userID, passToken); err != nil {
++	if err := cloud.LoginWithTokenContext(ctx, userID, passToken); err != nil {
+ 		return nil, "", "", err
+ 	}
+ 	rotatedUserID, rotatedToken := cloud.UserToken()
+@@ -76,8 +76,27 @@ var requestCloud = func(ctx context.Context, cloud *xiaomi.Cloud, baseURL, apiUR
+ 	return cloud.RequestWithContext(ctx, baseURL, apiURL, params, nil)
+ }
+ 
+-func getCloud(userID string) (*xiaomi.Cloud, error) {
+-	cloudsMu.Lock()
++func lockClouds(ctx context.Context) error {
++	for !cloudsMu.TryLock() {
++		timer := time.NewTimer(10 * time.Millisecond)
++		select {
++		case <-ctx.Done():
++			timer.Stop()
++			return ctx.Err()
++		case <-timer.C:
++		}
++	}
++	if err := ctx.Err(); err != nil {
++		cloudsMu.Unlock()
++		return err
++	}
++	return nil
++}
++
++func getCloudContext(ctx context.Context, userID string) (*xiaomi.Cloud, error) {
++	if err := lockClouds(ctx); err != nil {
++		return nil, err
++	}
+ 	defer cloudsMu.Unlock()
+ 
+ 	cloud := clouds[userID]
+@@ -88,15 +107,15 @@ func getCloud(userID string) (*xiaomi.Cloud, error) {
+ 		return cloud, nil
+ 	}
+ 
+-	return establishCloudLocked(userID)
++	return establishCloudLocked(ctx, userID)
+ }
+ 
+-func establishCloudLocked(userID string) (*xiaomi.Cloud, error) {
++func establishCloudLocked(ctx context.Context, userID string) (*xiaomi.Cloud, error) {
+ 	passToken := tokens[userID]
+ 	if passToken == "" {
+ 		return nil, &xiaomi.CloudError{Kind: xiaomi.CloudErrorCredentialRejected}
+ 	}
+-	cloud, rotatedUserID, rotatedToken, err := authenticateCloudToken(userID, passToken)
++	cloud, rotatedUserID, rotatedToken, err := authenticateCloudToken(ctx, userID, passToken)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -128,10 +147,9 @@ type cloudCredentialRejection struct {
+ 	err       error
+ }
+ 
+-func renewCloud(userID string, stale *xiaomi.Cloud) (*xiaomi.Cloud, error) {
+-	if !cloudsMu.TryLock() {
+-		logCloudRenewal(userID, "singleflight_wait")
+-		cloudsMu.Lock()
++func renewCloud(ctx context.Context, userID string, stale *xiaomi.Cloud) (*xiaomi.Cloud, error) {
++	if err := lockClouds(ctx); err != nil {
++		return nil, err
+ 	}
+ 	defer cloudsMu.Unlock()
+ 
+@@ -145,7 +163,7 @@ func renewCloud(userID string, stale *xiaomi.Cloud) (*xiaomi.Cloud, error) {
+ 	}
+ 	passToken := tokens[userID]
+ 	logCloudRenewal(userID, "login_started")
+-	cloud, err := establishCloudLocked(userID)
++	cloud, err := establishCloudLocked(ctx, userID)
+ 	if passToken != "" && cloudErrorIs(err, xiaomi.CloudErrorCredentialRejected) {
+ 		if credentialRejections == nil {
+ 			credentialRejections = make(map[string]cloudCredentialRejection)
+@@ -191,7 +209,7 @@ func cloudRequestContext(ctx context.Context, userID, region, apiURL, params str
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	cloud, err := getCloud(userID)
++	cloud, err := getCloudContext(ctx, userID)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -205,7 +223,7 @@ func cloudRequestContext(ctx context.Context, userID, region, apiURL, params str
+ 	}
+ 
+ 	logCloudRenewal(userID, "detected")
+-	cloud, err = renewCloud(userID, cloud)
++	cloud, err = renewCloud(ctx, userID, cloud)
+ 	if err != nil {
+ 		if cloudErrorIs(err, xiaomi.CloudErrorCredentialRejected) {
+ 			logCloudRenewal(userID, "reauth_required")
+@@ -221,30 +239,30 @@ func cloudErrorIs(err error, kind xiaomi.CloudErrorKind) bool {
+ 	return errors.As(err, &cloudErr) && cloudErr.Kind == kind
+ }
+ 
+-func cloudUserRequest(user *url.Userinfo, apiURL, params string) ([]byte, error) {
++func cloudUserRequestContext(ctx context.Context, user *url.Userinfo, apiURL, params string) ([]byte, error) {
+ 	userID := user.Username()
+ 	region, _ := user.Password()
+-	return cloudRequest(userID, region, apiURL, params)
++	return cloudRequestContext(ctx, userID, region, apiURL, params)
+ }
+ 
+-func getCameraURL(url *url.URL) (string, error) {
++func getCameraURLContext(ctx context.Context, url *url.URL) (string, error) {
+ 	model := url.Query().Get("model")
+ 
+ 	// It is not known which models need to be awakened.
+ 	// Probably all the doorbells and all the battery cameras.
+ 	if strings.Contains(model, ".cateye.") {
+-		_ = wakeUpCamera(url)
++		_ = wakeUpCameraContext(ctx, url)
+ 	}
+ 
+ 	// The getMissURL request has a fallback to getP2PURL.
+ 	// But for known models we can save one request to the cloud.
+ 	if xiaomi.IsLegacy(model) {
+-		return getLegacyURL(url)
++		return getLegacyURLContext(ctx, url)
+ 	}
+-	return getMissURL(url)
++	return getMissURLContext(ctx, url)
+ }
+ 
+-func getLegacyURL(url *url.URL) (string, error) {
++func getLegacyURLContext(ctx context.Context, url *url.URL) (string, error) {
+ 	query := url.Query()
+ 
+ 	clientPublic, clientPrivate, err := crypto.GenerateKey()
+@@ -256,7 +274,7 @@ func getLegacyURL(url *url.URL) (string, error) {
+ 
+ 	userID := url.User.Username()
+ 	region, _ := url.User.Password()
+-	res, err := cloudRequest(userID, region, "/device/devicepass", params)
++	res, err := cloudRequestContext(ctx, userID, region, "/device/devicepass", params)
+ 	if err != nil {
+ 		return "", err
+ 	}
+@@ -286,7 +304,7 @@ func getLegacyURL(url *url.URL) (string, error) {
+ 	return url.String(), nil
+ }
+ 
+-func getMissURL(url *url.URL) (string, error) {
++func getMissURLContext(ctx context.Context, url *url.URL) (string, error) {
+ 	clientPublic, clientPrivate, err := crypto.GenerateKey()
+ 	if err != nil {
+ 		return "", err
+@@ -298,10 +316,10 @@ func getMissURL(url *url.URL) (string, error) {
+ 		clientPublic, query.Get("did"),
+ 	)
+ 
+-	res, err := cloudUserRequest(url.User, "/v2/device/miss_get_vendor", params)
++	res, err := cloudUserRequestContext(ctx, url.User, "/v2/device/miss_get_vendor", params)
+ 	if err != nil {
+ 		if strings.Contains(err.Error(), "no available vendor support") {
+-			return getLegacyURL(url)
++			return getLegacyURLContext(ctx, url)
+ 		}
+ 		return "", err
+ 	}
+@@ -348,10 +366,10 @@ func getVendorName(i byte) string {
+ 	return fmt.Sprintf("%d", i)
+ }
+ 
+-func wakeUpCamera(url *url.URL) error {
++func wakeUpCameraContext(ctx context.Context, url *url.URL) error {
+ 	const params = `{"id":1,"method":"wakeup","params":{"video":"1"}}`
+ 	did := url.Query().Get("did")
+-	_, err := cloudUserRequest(url.User, "/home/rpc/"+did, params)
++	_, err := cloudUserRequestContext(ctx, url.User, "/home/rpc/"+did, params)
+ 	return err
+ }
+ 
+diff --git a/pkg/core/core.go b/pkg/core/core.go
+index 9555ecf..df06ada 100644
+--- a/pkg/core/core.go
++++ b/pkg/core/core.go
+@@ -1,6 +1,13 @@
+ package core
+ 
+-import "encoding/json"
++import (
++	"encoding/json"
++	"errors"
++)
++
++// ErrNoAudio means a source explicitly requested audio but probing did not
++// obtain a supported audio track. It is never permission to retry video-only.
++var ErrNoAudio = errors.New("no audio")
+ 
+ const (
+ 	DirectionRecvonly = "recvonly"
+@@ -57,6 +64,13 @@ type Producer interface {
+ 	Stop() error
+ }
+ 
++// PreparedProducer owns a complete receive-track set before Start. GetTrack
++// only looks up that set; consumers may never append tracks to its running reader.
++type PreparedProducer interface {
++	Producer
++	PreparedReceivers() []*Receiver
++}
++
+ type Consumer interface {
+ 	// GetMedias - return Media(s) with local Media.Direction:
+ 	// - sendonly for Consumer Video/Audio
+diff --git a/pkg/core/node.go b/pkg/core/node.go
+index a9959c3..e332e03 100644
+--- a/pkg/core/node.go
++++ b/pkg/core/node.go
+@@ -34,45 +34,78 @@ type Node struct {
+ 	mu sync.Mutex
+ }
+ 
++// Structural operations also serialize with producer reconnect (MoveNode).
++// Packet dispatch only snapshots a node's children and never takes this lock.
++var nodeLinksMu sync.Mutex
++
+ func (n *Node) WithParent(parent *Node) *Node {
+ 	parent.AppendChild(n)
+ 	return n
+ }
+ 
+ func (n *Node) AppendChild(child *Node) {
++	nodeLinksMu.Lock()
++	defer nodeLinksMu.Unlock()
++	child.mu.Lock()
++	child.parent = n
++	child.mu.Unlock()
+ 	n.mu.Lock()
+-	n.childs = append(n.childs, child)
++	// Published child snapshots are immutable while callbacks run unlocked.
++	n.childs = append(append([]*Node(nil), n.childs...), child)
+ 	n.mu.Unlock()
+-
+-	child.parent = n
+ }
+ 
+ func (n *Node) RemoveChild(child *Node) {
++	nodeLinksMu.Lock()
++	defer nodeLinksMu.Unlock()
++	n.removeChild(child)
++}
++
++func (n *Node) removeChild(child *Node) {
+ 	n.mu.Lock()
+ 	for i, ch := range n.childs {
+ 		if ch == child {
+-			n.childs = append(n.childs[:i], n.childs[i+1:]...)
++			children := append([]*Node(nil), n.childs[:i]...)
++			n.childs = append(children, n.childs[i+1:]...)
+ 			break
+ 		}
+ 	}
+ 	n.mu.Unlock()
+ }
+ 
++func (n *Node) children() []*Node {
++	n.mu.Lock()
++	defer n.mu.Unlock()
++	return n.childs
++}
++
+ func (n *Node) Close() {
+-	if parent := n.parent; parent != nil {
+-		parent.RemoveChild(n)
++	nodeLinksMu.Lock()
++	defer nodeLinksMu.Unlock()
++	n.closeNode()
++}
++
++func (n *Node) closeNode() {
++	n.mu.Lock()
++	parent := n.parent
++	n.parent = nil
++	n.mu.Unlock()
++	if parent != nil {
++		parent.removeChild(n)
+ 
+-		if len(parent.childs) == 0 {
+-			parent.Close()
++		if len(parent.children()) == 0 {
++			parent.closeNode()
+ 		}
+ 	} else {
+-		for _, childs := range n.childs {
+-			childs.Close()
++		for _, childs := range n.children() {
++			childs.closeNode()
+ 		}
+ 	}
+ }
+ 
+ func MoveNode(dst, src *Node) {
++	nodeLinksMu.Lock()
++	defer nodeLinksMu.Unlock()
+ 	src.mu.Lock()
+ 	childs := src.childs
+ 	src.childs = nil
+@@ -83,6 +116,8 @@ func MoveNode(dst, src *Node) {
+ 	dst.mu.Unlock()
+ 
+ 	for _, child := range childs {
++		child.mu.Lock()
+ 		child.parent = dst
++		child.mu.Unlock()
+ 	}
+ }
+diff --git a/pkg/core/track.go b/pkg/core/track.go
+index f363a9f..ac4ba18 100644
+--- a/pkg/core/track.go
++++ b/pkg/core/track.go
+@@ -29,7 +29,7 @@ func NewReceiver(media *Media, codec *Codec) *Receiver {
+ 	r.Input = func(packet *Packet) {
+ 		r.Bytes += len(packet.Payload)
+ 		r.Packets++
+-		for _, child := range r.childs {
++		for _, child := range r.children() {
+ 			child.Input(packet)
+ 		}
+ 	}
+@@ -43,7 +43,7 @@ func (r *Receiver) WriteRTP(packet *rtp.Packet) {
+ 
+ // Deprecated: should be removed
+ func (r *Receiver) Senders() []*Sender {
+-	if len(r.childs) > 0 {
++	if len(r.children()) > 0 {
+ 		return []*Sender{{}}
+ 	} else {
+ 		return nil
+@@ -189,7 +189,7 @@ func (r *Receiver) MarshalJSON() ([]byte, error) {
+ 		Bytes:   r.Bytes,
+ 		Packets: r.Packets,
+ 	}
+-	for _, child := range r.childs {
++	for _, child := range r.children() {
+ 		v.Childs = append(v.Childs, child.id)
+ 	}
+ 	return json.Marshal(v)
+@@ -210,8 +210,10 @@ func (s *Sender) MarshalJSON() ([]byte, error) {
+ 		Packets: s.Packets,
+ 		Drops:   s.Drops,
+ 	}
++	s.mu.Lock()
+ 	if s.parent != nil {
+ 		v.Parent = s.parent.id
+ 	}
++	s.mu.Unlock()
+ 	return json.Marshal(v)
+ }
+diff --git a/pkg/rtsp/conn.go b/pkg/rtsp/conn.go
+index 2984c78..3be2ac4 100644
+--- a/pkg/rtsp/conn.go
++++ b/pkg/rtsp/conn.go
+@@ -30,6 +30,9 @@ type Conn struct {
+ 	SessionName string
+ 	Timeout     int
+ 	Transport   string // custom transport support, ex. RTSP over WebSocket
++	// ServerRequestPolicy restricts a product server without changing generic RTSP.
++	ServerRequestPolicy     func(*tcp.Request) string
++	ServerHandshakeDeadline time.Time
+ 
+ 	URL *url.URL
+ 
+@@ -204,13 +207,18 @@ func (c *Conn) handleTCPData() error {
+ 	if buf4[0] != '$' {
+ 		switch string(buf4) {
+ 		case "RTSP":
++			if c.ServerRequestPolicy != nil {
++				return fmt.Errorf("RTSP playback server does not accept responses")
++			}
+ 			var res *tcp.Response
+ 			if res, err = c.ReadResponse(); err != nil {
+ 				return err
+ 			}
+ 			c.Fire(res)
+ 			// for playing backchannel only after OK response on play
++			c.stateMu.Lock()
+ 			c.playOK = true
++			c.stateMu.Unlock()
+ 			return nil
+ 
+ 		case "OPTI", "TEAR", "DESC", "SETU", "PLAY", "PAUS", "RECO", "ANNO", "GET_", "SET_":
+@@ -219,6 +227,18 @@ func (c *Conn) handleTCPData() error {
+ 				return err
+ 			}
+ 			c.Fire(req)
++			if c.ServerRequestPolicy != nil {
++				status := c.ServerRequestPolicy(req)
++				if status != "" {
++					_ = c.WriteResponse(&tcp.Response{Status: status, Request: req})
++					return fmt.Errorf("RTSP request rejected: %s", status)
++				}
++				if req.Method == MethodTeardown {
++					_ = c.WriteResponse(&tcp.Response{Request: req})
++					return io.EOF
++				}
++				return c.WriteResponse(&tcp.Response{Request: req})
++			}
+ 			if req.Method == MethodOptions {
+ 				res := &tcp.Response{Request: req}
+ 				if err = c.WriteResponse(res); err != nil {
+@@ -228,6 +248,9 @@ func (c *Conn) handleTCPData() error {
+ 			return nil
+ 
+ 		default:
++			if c.ServerRequestPolicy != nil {
++				return fmt.Errorf("RTSP playback server received an invalid prefix")
++			}
+ 			c.Fire("RTSP wrong input")
+ 
+ 			for i := 0; ; i++ {
+@@ -265,6 +288,9 @@ func (c *Conn) handleTCPData() error {
+ 	} else {
+ 		// hope that the odd channels are always RTCP
+ 		channel = buf4[1]
++		if c.ServerRequestPolicy != nil && (channel&1 == 0 || int(channel/2) >= len(c.Senders) || c.Senders[channel/2].Media.ID != MethodSetup) {
++			return fmt.Errorf("RTSP playback server accepts only configured track RTCP channels")
++		}
+ 
+ 		// get data size
+ 		size = binary.BigEndian.Uint16(buf4[2:])
+@@ -353,9 +379,16 @@ func (c *Conn) WriteRequest(req *tcp.Request) error {
+ }
+ 
+ func (c *Conn) ReadRequest() (*tcp.Request, error) {
+-	if err := c.conn.SetReadDeadline(time.Now().Add(Timeout)); err != nil {
++	deadline := time.Now().Add(Timeout)
++	if !c.ServerHandshakeDeadline.IsZero() && c.ServerHandshakeDeadline.Before(deadline) {
++		deadline = c.ServerHandshakeDeadline
++	}
++	if err := c.conn.SetReadDeadline(deadline); err != nil {
+ 		return nil, err
+ 	}
++	if c.ServerRequestPolicy != nil {
++		return tcp.ReadRequestLimited(c.reader, 16*1024, 4*1024)
++	}
+ 	return tcp.ReadRequest(c.reader)
+ }
+ 
+diff --git a/pkg/rtsp/consumer.go b/pkg/rtsp/consumer.go
+index e6525d9..8f03db1 100644
+--- a/pkg/rtsp/consumer.go
++++ b/pkg/rtsp/consumer.go
+@@ -87,13 +87,18 @@ func (c *Conn) packetWriter(codec *core.Codec, channel, payloadType uint8) core.
+ 	flushBuf := func() {
+ 		//log.Printf("[rtsp] channel:%2d write_size:%6d buffer_size:%6d", channel, n, len(buf))
+ 		if err := c.writeInterleavedData(buf[:n]); err != nil {
++			c.stateMu.Lock()
+ 			c.Send += n
++			c.stateMu.Unlock()
+ 		}
+ 		n = 0
+ 	}
+ 
+ 	handlerFunc := func(packet *rtp.Packet) {
+-		if c.state == StateNone {
++		c.stateMu.Lock()
++		state, playOK := c.state, c.playOK
++		c.stateMu.Unlock()
++		if state == StateNone {
+ 			return
+ 		}
+ 
+@@ -138,7 +143,7 @@ func (c *Conn) packetWriter(codec *core.Codec, channel, payloadType uint8) core.
+ 
+ 		n += 4 + size
+ 
+-		if !packet.Marker || !c.playOK {
++		if !packet.Marker || !playOK {
+ 			// collect continious video packets to buffer
+ 			// or wait OK for PLAY command for backchannel
+ 			//log.Printf("[rtsp] collecting buffer ok=%t", c.playOK)
+diff --git a/pkg/rtsp/server.go b/pkg/rtsp/server.go
+index 343bdc6..90c196b 100644
+--- a/pkg/rtsp/server.go
++++ b/pkg/rtsp/server.go
+@@ -8,6 +8,7 @@ import (
+ 	"net/url"
+ 	"strconv"
+ 	"strings"
++	"time"
+ 
+ 	"github.com/AlexxIT/go2rtc/pkg/core"
+ 	"github.com/AlexxIT/go2rtc/pkg/tcp"
+@@ -65,12 +66,22 @@ func (c *Conn) Accept() error {
+ 		}
+ 
+ 		// Receiver: OPTIONS > DESCRIBE > SETUP... > PLAY > TEARDOWN
++		if c.ServerRequestPolicy != nil {
++			if status := c.ServerRequestPolicy(req); status != "" {
++				_ = c.WriteResponse(&tcp.Response{Status: status, Request: req})
++				return errors.New("RTSP request rejected: " + status)
++			}
++		}
+ 		// Sender: OPTIONS > ANNOUNCE > SETUP... > RECORD > TEARDOWN
+ 		switch req.Method {
+ 		case MethodOptions:
++			public := "OPTIONS, SETUP, TEARDOWN, DESCRIBE, PLAY, PAUSE, ANNOUNCE, RECORD"
++			if c.ServerRequestPolicy != nil {
++				public = "OPTIONS, DESCRIBE, SETUP, PLAY, GET_PARAMETER, TEARDOWN"
++			}
+ 			res := &tcp.Response{
+ 				Header: map[string][]string{
+-					"Public": {"OPTIONS, SETUP, TEARDOWN, DESCRIBE, PLAY, PAUSE, ANNOUNCE, RECORD"},
++					"Public": {public},
+ 				},
+ 				Request: req,
+ 			}
+@@ -166,8 +177,12 @@ func (c *Conn) Accept() error {
+ 			// Test if client requests TCP transport, otherwise return 461 Transport not supported
+ 			// This allows smart clients who initially requested UDP to fall back on TCP transport
+ 			if tr := req.Header.Get("Transport"); strings.HasPrefix(tr, "RTP/AVP/TCP") {
+-				c.session = core.RandString(8, 10)
++				if c.session == "" {
++					c.session = core.RandString(8, 10)
++				}
++				c.stateMu.Lock()
+ 				c.state = StateSetup
++				c.stateMu.Unlock()
+ 
+ 				if c.mode == core.ModePassiveConsumer {
+ 					if i := reqTrackID(req); i >= 0 && i < len(c.Senders)+len(c.Receivers) {
+@@ -193,6 +208,7 @@ func (c *Conn) Accept() error {
+ 			}
+ 
+ 		case MethodRecord, MethodPlay:
++			c.ServerHandshakeDeadline = time.Time{}
+ 			if c.mode == core.ModePassiveConsumer {
+ 				// stop unconfigured senders
+ 				for _, track := range c.Senders {
+@@ -204,13 +220,17 @@ func (c *Conn) Accept() error {
+ 
+ 			res := &tcp.Response{Request: req}
+ 			err = c.WriteResponse(res)
++			c.stateMu.Lock()
+ 			c.playOK = true
++			c.stateMu.Unlock()
+ 			return err
+ 
+ 		case MethodTeardown:
+ 			res := &tcp.Response{Request: req}
+ 			_ = c.WriteResponse(res)
++			c.stateMu.Lock()
+ 			c.state = StateNone
++			c.stateMu.Unlock()
+ 			return c.conn.Close()
+ 
+ 		default:
+diff --git a/pkg/tcp/textproto.go b/pkg/tcp/textproto.go
+index c629015..b98f0c0 100644
+--- a/pkg/tcp/textproto.go
++++ b/pkg/tcp/textproto.go
+@@ -2,6 +2,7 @@ package tcp
+ 
+ import (
+ 	"bufio"
++	"bytes"
+ 	"errors"
+ 	"fmt"
+ 	"io"
+@@ -110,6 +111,44 @@ func (r *Request) Write(w io.Writer) (err error) {
+ }
+ 
+ func ReadRequest(r *bufio.Reader) (*Request, error) {
++	req, err := readRequestHeader(r)
++	if err != nil {
++		return nil, err
++	}
++	return readRequestBody(r, req, 0)
++}
++
++// ReadRequestLimited bounds public product control messages before authentication.
++// ReadSlice consumes exactly the header, preserving any pipelined next request.
++func ReadRequestLimited(r *bufio.Reader, maxHeader, maxBody int) (*Request, error) {
++	var header []byte
++	lineSize := 0
++	for {
++		chunk, err := r.ReadSlice('\n')
++		if len(header)+len(chunk) > maxHeader {
++			return nil, fmt.Errorf("request header too large")
++		}
++		header = append(header, chunk...)
++		lineSize += len(chunk)
++		if err == bufio.ErrBufferFull {
++			continue
++		}
++		if err != nil {
++			return nil, err
++		}
++		if (lineSize == 2 && bytes.Equal(chunk, []byte("\r\n"))) || (lineSize == 1 && bytes.Equal(chunk, []byte("\n"))) {
++			break
++		}
++		lineSize = 0
++	}
++	req, err := readRequestHeader(bufio.NewReader(bytes.NewReader(header)))
++	if err != nil {
++		return nil, err
++	}
++	return readRequestBody(r, req, maxBody)
++}
++
++func readRequestHeader(r *bufio.Reader) (*Request, error) {
+ 	tp := textproto.NewReader(r)
+ 
+ 	line, err := tp.ReadLine()
+@@ -136,10 +175,15 @@ func ReadRequest(r *bufio.Reader) (*Request, error) {
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	return req, nil
++}
+ 
++func readRequestBody(r *bufio.Reader, req *Request, limit int) (*Request, error) {
+ 	if val := req.Header.Get("Content-Length"); val != "" {
+-		var i int
+-		i, err = strconv.Atoi(val)
++		i, err := strconv.Atoi(val)
++		if err != nil || i < 0 || (limit > 0 && i > limit) {
++			return nil, fmt.Errorf("invalid request content length")
++		}
+ 		req.Body = make([]byte, i)
+ 		if _, err = io.ReadAtLeast(r, req.Body, i); err != nil {
+ 			return nil, err
+diff --git a/pkg/tcp/udp_context.go b/pkg/tcp/udp_context.go
+index e69de29..d5d4861 100644
+--- a/pkg/tcp/udp_context.go
++++ b/pkg/tcp/udp_context.go
+@@ -0,0 +1,29 @@
++package tcp
++
++import (
++	"context"
++	"net"
++	"strconv"
++	"strings"
++)
++
++// ResolveUDPContext supports a bare camera host or an explicit host:port without
++// leaving an uncancellable DNS operation ahead of the P2P socket owner.
++func ResolveUDPContext(ctx context.Context, address string, defaultPort int) (*net.UDPAddr, error) {
++	host, port, err := net.SplitHostPort(address)
++	if err != nil {
++		host, port = strings.Trim(address, "[]"), strconv.Itoa(defaultPort)
++	}
++	p, err := strconv.Atoi(port)
++	if err != nil || p < 0 || p > 65535 {
++		return nil, &net.AddrError{Err: "invalid UDP port", Addr: address}
++	}
++	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
++	if err != nil {
++		return nil, err
++	}
++	if len(ips) == 0 {
++		return nil, &net.AddrError{Err: "no IP address", Addr: address}
++	}
++	return &net.UDPAddr{IP: ips[0].IP, Zone: ips[0].Zone, Port: p}, nil
++}
+diff --git a/pkg/tutk/conn.go b/pkg/tutk/conn.go
+index e061069..38f6e02 100644
+--- a/pkg/tutk/conn.go
++++ b/pkg/tutk/conn.go
+@@ -1,7 +1,9 @@
+ package tutk
+ 
+ import (
++	"context"
+ 	"fmt"
++	"github.com/AlexxIT/go2rtc/pkg/tcp"
+ 	"io"
+ 	"net"
+ 	"sync"
+@@ -10,17 +12,25 @@ import (
+ )
+ 
+ func Dial(host, uid, username, password string) (*Conn, error) {
+-	addr, err := net.ResolveUDPAddr("udp", host)
++	return DialContext(context.Background(), host, uid, username, password)
++}
++
++func DialContext(ctx context.Context, host, uid, username, password string) (*Conn, error) {
++	addr, err := tcp.ResolveUDPContext(ctx, host, 32761)
+ 	if err != nil {
+-		// Default port for listening incoming LAN connections.
+-		// Important. It's not using for real connection.
+-		addr = &net.UDPAddr{IP: net.ParseIP(host), Port: 32761}
++		return nil, err
+ 	}
+ 
+ 	udpConn, err := net.ListenUDP("udp", nil)
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	stopCancel := context.AfterFunc(ctx, func() { _ = udpConn.Close() })
++	defer stopCancel()
++	if ctx.Err() != nil {
++		_ = udpConn.Close()
++		return nil, ctx.Err()
++	}
+ 
+ 	c := &Conn{UDPConn: udpConn, addr: addr}
+ 
+@@ -62,7 +72,7 @@ type Conn struct {
+ 	ver    []byte
+ 	err    error
+ 	cmdMu  sync.Mutex
+-	cmdAck func()
++	cmdAck atomic.Pointer[chan struct{}] // independent of the command serialization lock
+ }
+ 
+ // Read overwrite net.Conn
+@@ -117,32 +127,25 @@ func (c *Conn) WriteCommand(ctrlType uint32, ctrlData []byte) error {
+ 	c.cmdMu.Lock()
+ 	defer c.cmdMu.Unlock()
+ 
+-	var repeat atomic.Int32
+-	repeat.Store(5)
+-
++	ack := make(chan struct{}, 1)
++	c.cmdAck.Store(&ack)
++	defer c.cmdAck.Store(nil)
+ 	timeout := time.NewTicker(time.Second)
+ 	defer timeout.Stop()
+ 
+-	c.cmdAck = func() {
+-		repeat.Store(0)
+-		timeout.Reset(1)
+-	}
+-
+ 	buf := c.session.SendIOCtrl(ctrlType, ctrlData)
+ 
+-	for {
++	for attempt := 0; attempt < 5; attempt++ {
+ 		if err := c.session.SessionWrite(0, buf); err != nil {
+ 			return err
+ 		}
+-		<-timeout.C
+-		r := repeat.Add(-1)
+-		if r < 0 {
++		select {
++		case <-ack:
+ 			return nil
+-		}
+-		if r == 0 {
+-			return fmt.Errorf("%s: can't send command %d", "tutk", ctrlType)
++		case <-timeout.C:
+ 		}
+ 	}
++	return fmt.Errorf("%s: can't send command %d", "tutk", ctrlType)
+ }
+ 
+ func (c *Conn) ReadPacket() (hdr, payload []byte, err error) {
+@@ -179,8 +182,11 @@ func (c *Conn) worker() {
+ 		case msgError:
+ 			return
+ 		case msgCommandAck:
+-			if c.cmdAck != nil {
+-				c.cmdAck()
++			if ack := c.cmdAck.Load(); ack != nil {
++				select {
++				case *ack <- struct{}{}:
++				default:
++				}
+ 			}
+ 		}
+ 	}
+diff --git a/pkg/xiaomi/cloud.go b/pkg/xiaomi/cloud.go
+index 1bbc51e..5019123 100644
+--- a/pkg/xiaomi/cloud.go
++++ b/pkg/xiaomi/cloud.go
+@@ -351,10 +351,18 @@ func (c *Cloud) finishAuth(location string) error {
+ }
+ 
+ func (c *Cloud) finishAuthResponse(location string, rejectionKind CloudErrorKind, requireSession bool) error {
++	return c.finishAuthResponseContext(context.Background(), location, rejectionKind, requireSession)
++}
++
++func (c *Cloud) finishAuthResponseContext(ctx context.Context, location string, rejectionKind CloudErrorKind, requireSession bool) error {
+ 	if location == "" {
+ 		return newCloudError(CloudErrorProtocol, RequestStageTokenFinish, nil)
+ 	}
+-	res, err := c.client.Get(location)
++	req, err := http.NewRequestWithContext(ctx, "GET", location, nil)
++	if err != nil {
++		return newCloudError(CloudErrorProtocol, RequestStageTokenFinish, err)
++	}
++	res, err := c.client.Do(req)
+ 	if err != nil {
+ 		return newCloudError(CloudErrorNetwork, RequestStageTokenFinish, err)
+ 	}
+@@ -411,10 +419,14 @@ func (c *Cloud) finishAuthResponse(location string, rejectionKind CloudErrorKind
+ }
+ 
+ func (c *Cloud) LoginWithToken(userID, passToken string) error {
++	return c.LoginWithTokenContext(context.Background(), userID, passToken)
++}
++
++func (c *Cloud) LoginWithTokenContext(ctx context.Context, userID, passToken string) error {
+ 	if userID == "" || passToken == "" {
+ 		return newCloudError(CloudErrorCredentialRejected, RequestStageTokenLogin, nil)
+ 	}
+-	req, err := http.NewRequest("GET", "https://account.xiaomi.com/pass/serviceLogin?_json=true&sid="+c.sid, nil)
++	req, err := http.NewRequestWithContext(ctx, "GET", "https://account.xiaomi.com/pass/serviceLogin?_json=true&sid="+c.sid, nil)
+ 	if err != nil {
+ 		return newCloudError(CloudErrorProtocol, RequestStageTokenLogin, err)
+ 	}
+@@ -454,7 +466,7 @@ func (c *Cloud) LoginWithToken(userID, passToken string) error {
+ 	c.ssecurity = v1.Ssecurity
+ 	c.passToken = v1.PassToken
+ 
+-	if err = c.finishAuthResponse(v1.Location, CloudErrorCredentialRejected, true); err != nil {
++	if err = c.finishAuthResponseContext(ctx, v1.Location, CloudErrorCredentialRejected, true); err != nil {
+ 		return err
+ 	}
+ 	if c.userID != userID || c.passToken == "" {
+diff --git a/pkg/xiaomi/legacy/client.go b/pkg/xiaomi/legacy/client.go
+index 242fda3..02b89ce 100644
+--- a/pkg/xiaomi/legacy/client.go
++++ b/pkg/xiaomi/legacy/client.go
+@@ -1,6 +1,7 @@
+ package legacy
+ 
+ import (
++	"context"
+ 	"encoding/binary"
+ 	"errors"
+ 	"fmt"
+@@ -11,6 +12,10 @@ import (
+ )
+ 
+ func NewClient(rawURL string) (*Client, error) {
++	return NewClientContext(context.Background(), rawURL)
++}
++
++func NewClientContext(ctx context.Context, rawURL string) (*Client, error) {
+ 	u, err := url.Parse(rawURL)
+ 	if err != nil {
+ 		return nil, err
+@@ -42,10 +47,16 @@ func NewClient(rawURL string) (*Client, error) {
+ 		return nil, fmt.Errorf("xiaomi: unsupported model: %s", model)
+ 	}
+ 
+-	conn, err := tutk.Dial(u.Host, query.Get("uid"), username, password)
++	conn, err := tutk.DialContext(ctx, u.Host, query.Get("uid"), username, password)
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	stopCancel := context.AfterFunc(ctx, func() { _ = conn.Close() })
++	defer stopCancel()
++	if ctx.Err() != nil {
++		_ = conn.Close()
++		return nil, ctx.Err()
++	}
+ 
+ 	if model == ModelXiaofang {
+ 		err = xiaofangLogin(conn, query.Get("password"))
+@@ -115,14 +126,22 @@ func (c *Client) ReadPacket() (hdr, payload []byte, err error) {
+ }
+ 
+ func (c *Client) StartMedia(video, audio string) error {
+-	switch c.model {
++	return startMedia(c.model, video, audio, c.WriteCommand)
++}
++
++func startMedia(model, video, audio string, writeCommand func(uint32, []byte) error) error {
++	switch model {
+ 	case ModelAqaraG2:
+-		return c.WriteCommand(0x01ff, []byte(`{}`))
++		return writeCommand(0x01ff, []byte(`{}`))
+ 
+ 	case ModelXiaobai:
+ 		// 00030000 7b7d  audio on
+ 		// 01030000 7b7d  audio off
+-		if err := c.WriteCommand(0x0300, []byte(`{}`)); err != nil {
++		command := uint32(0x0300)
++		if audio == "0" {
++			command = 0x0301
++		}
++		if err := writeCommand(command, []byte(`{}`)); err != nil {
+ 			return err
+ 		}
+ 
+@@ -141,13 +160,13 @@ func (c *Client) StartMedia(video, audio string) error {
+ 		// 20030000 0000000002000000  hd (1280x720)
+ 		// 20030000 0000000004000000  low (640x360)
+ 		// 20030000 00000000ff000000  auto (1920x1080)
+-		if err := c.WriteCommand(0x0320, []byte{0, 0, 0, 0, b, 0, 0, 0}); err != nil {
++		if err := writeCommand(0x0320, []byte{0, 0, 0, 0, b, 0, 0, 0}); err != nil {
+ 			return err
+ 		}
+ 
+ 		// ff010000 7b7d  video tart
+ 		// ff020000 7b7d  video stop
+-		return c.WriteCommand(0x01ff, []byte(`{}`))
++		return writeCommand(0x01ff, []byte(`{}`))
+ 
+ 	case ModelXiaofang:
+ 		// 00010000 4943414d 95010400000000000000000600000000000000d20400005a07 - 90k bitrate
+@@ -168,6 +187,8 @@ func (c *Client) StartMedia(video, audio string) error {
+ 	return nil
+ }
+ 
++func AudioControlSupported(model string) bool { return model == ModelXiaobai }
++
+ func (c *Client) StopMedia() error {
+ 	return errors.Join(
+ 		c.WriteCommand(0x02ff, []byte(`{}`)),
+diff --git a/pkg/xiaomi/legacy/producer.go b/pkg/xiaomi/legacy/producer.go
+index 92375fa..d9af8c0 100644
+--- a/pkg/xiaomi/legacy/producer.go
++++ b/pkg/xiaomi/legacy/producer.go
+@@ -1,6 +1,7 @@
+ package legacy
+ 
+ import (
++	"context"
+ 	"net/url"
+ 	"time"
+ 
+@@ -14,21 +15,39 @@ import (
+ )
+ 
+ func Dial(rawURL string) (*Producer, error) {
+-	client, err := NewClient(rawURL)
++	return DialContext(context.Background(), rawURL)
++}
++
++func DialContext(ctx context.Context, rawURL string) (*Producer, error) {
++	client, err := NewClientContext(ctx, rawURL)
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	stopCancel := context.AfterFunc(ctx, func() { _ = client.Close() })
++	prepared := false
++	defer func() {
++		if !prepared {
++			stopCancel()
++		}
++	}()
++	if ctx.Err() != nil {
++		_ = client.Close()
++		return nil, ctx.Err()
++	}
+ 
+ 	u, _ := url.Parse(rawURL)
+ 	query := u.Query()
+ 
+-	err = client.StartMedia(query.Get("subtype"), "")
++	err = client.StartMedia(query.Get("subtype"), query.Get("audio"))
+ 	if err != nil {
+ 		_ = client.Close()
+ 		return nil, err
+ 	}
+ 
+-	medias, err := probe(client)
++	// Other legacy models retain their existing startup/probe behavior. Only
++	// Xiaobai has a verified audio-off command; never guess one for a model.
++	audio := !AudioControlSupported(query.Get("model")) || query.Get("audio") != "0"
++	medias, err := probe(client, audio)
+ 	if err != nil {
+ 		_ = client.Close()
+ 		return nil, err
+@@ -44,19 +63,27 @@ func Dial(rawURL string) (*Producer, error) {
+ 			Medias:     medias,
+ 			Transport:  client,
+ 		},
+-		client: client,
++		client:           client,
++		stopCancellation: stopCancel,
+ 	}
++	prepared = true
+ 	return c, nil
+ }
+ 
+ type Producer struct {
+ 	core.Connection
+-	client *Client
++	client           *Client
++	stopCancellation func() bool
+ }
+ 
+ const codecXiaobaiPCMA = 1 // chuangmi.camera.xiaobai
+ 
+-func probe(client *Client) ([]*core.Media, error) {
++type mediaProbeReader interface {
++	SetDeadline(time.Time) error
++	ReadPacket() ([]byte, []byte, error)
++}
++
++func probe(client mediaProbeReader, audio bool) ([]*core.Media, error) {
+ 	_ = client.SetDeadline(time.Now().Add(15 * time.Second))
+ 
+ 	var vcodec, acodec *core.Codec
+@@ -73,6 +100,9 @@ func probe(client *Client) ([]*core.Media, error) {
+ 		// 18  0000
+ 		hdr, payload, err := client.ReadPacket()
+ 		if err != nil {
++			if audio && vcodec != nil && acodec == nil {
++				return nil, core.ErrNoAudio
++			}
+ 			return nil, err
+ 		}
+ 
+@@ -91,15 +121,15 @@ func probe(client *Client) ([]*core.Media, error) {
+ 				}
+ 			}
+ 		case tutk.CodecPCMA, codecXiaobaiPCMA:
+-			if acodec == nil {
++			if audio && acodec == nil {
+ 				acodec = &core.Codec{Name: core.CodecPCMA, ClockRate: 8000}
+ 			}
+ 		case tutk.CodecPCML:
+-			if acodec == nil {
++			if audio && acodec == nil {
+ 				acodec = &core.Codec{Name: core.CodecPCML, ClockRate: 8000}
+ 			}
+ 		case tutk.CodecAACLATM:
+-			if acodec == nil {
++			if audio && acodec == nil {
+ 				acodec = aac.ADTSToCodec(payload)
+ 				if acodec != nil {
+ 					acodec.PayloadType = core.PayloadTypeRAW
+@@ -107,7 +137,7 @@ func probe(client *Client) ([]*core.Media, error) {
+ 			}
+ 		}
+ 
+-		if vcodec != nil && acodec != nil {
++		if vcodec != nil && (!audio || acodec != nil) {
+ 			break
+ 		}
+ 	}
+@@ -118,11 +148,9 @@ func probe(client *Client) ([]*core.Media, error) {
+ 			Direction: core.DirectionRecvonly,
+ 			Codecs:    []*core.Codec{vcodec},
+ 		},
+-		{
+-			Kind:      core.KindAudio,
+-			Direction: core.DirectionRecvonly,
+-			Codecs:    []*core.Codec{acodec},
+-		},
++	}
++	if acodec != nil {
++		medias = append(medias, &core.Media{Kind: core.KindAudio, Direction: core.DirectionRecvonly, Codecs: []*core.Codec{acodec}})
+ 	}
+ 	return medias, nil
+ }
+@@ -211,6 +239,9 @@ func (c *Producer) Start() error {
+ }
+ 
+ func (c *Producer) Stop() error {
++	if c.stopCancellation != nil {
++		defer c.stopCancellation()
++	}
+ 	_ = c.client.StopMedia()
+ 	return c.Connection.Stop()
+ }
+diff --git a/pkg/xiaomi/miss/client.go b/pkg/xiaomi/miss/client.go
+index d7b5479..8ff1d74 100644
+--- a/pkg/xiaomi/miss/client.go
++++ b/pkg/xiaomi/miss/client.go
+@@ -2,6 +2,7 @@ package miss
+ 
+ import (
+ 	"bytes"
++	"context"
+ 	"encoding/binary"
+ 	"encoding/hex"
+ 	"errors"
+@@ -38,6 +39,10 @@ type Conn interface {
+ }
+ 
+ func NewClient(rawURL string) (*Client, error) {
++	return NewClientContext(context.Background(), rawURL)
++}
++
++func NewClientContext(ctx context.Context, rawURL string) (*Client, error) {
+ 	u, err := url.Parse(rawURL)
+ 	if err != nil {
+ 		return nil, err
+@@ -53,20 +58,17 @@ func NewClient(rawURL string) (*Client, error) {
+ 	model := query.Get("model")
+ 
+ 	// 2. Check if this vendor supported.
+-	var conn Conn
+-	switch s := query.Get("vendor"); s {
+-	case "cs2":
+-		conn, err = cs2.Dial(u.Host, query.Get("transport"))
+-	case "tutk":
+-		conn, err = tutk.Dial(u.Host, query.Get("uid"), "Miss", "client")
+-	default:
+-		err = fmt.Errorf("miss: unsupported vendor %s", s)
+-	}
+-
++	conn, err := dialTransport(ctx, u)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 
++	stopCancel := context.AfterFunc(ctx, func() { _ = conn.Close() })
++	defer stopCancel()
++	if ctx.Err() != nil {
++		_ = conn.Close()
++		return nil, ctx.Err()
++	}
+ 	err = login(conn, query.Get("client_public"), query.Get("sign"))
+ 	if err != nil {
+ 		_ = conn.Close()
+@@ -78,6 +80,20 @@ func NewClient(rawURL string) (*Client, error) {
+ 	return client, nil
+ }
+ 
++// External transport I/O is a single seam shared by real source construction
++// and cancellation tests. It does not select a second product source lifecycle.
++var dialTransport = func(ctx context.Context, u *url.URL) (Conn, error) {
++	query := u.Query()
++	switch vendor := query.Get("vendor"); vendor {
++	case "cs2":
++		return cs2.DialContext(ctx, u.Host, query.Get("transport"))
++	case "tutk":
++		return tutk.DialContext(ctx, u.Host, query.Get("uid"), "Miss", "client")
++	default:
++		return nil, fmt.Errorf("miss: unsupported vendor %s", vendor)
++	}
++}
++
+ type Client struct {
+ 	Conn
+ 	key       []byte
+diff --git a/pkg/xiaomi/miss/cs2/conn.go b/pkg/xiaomi/miss/cs2/conn.go
+index f74956f..077d91f 100644
+--- a/pkg/xiaomi/miss/cs2/conn.go
++++ b/pkg/xiaomi/miss/cs2/conn.go
+@@ -3,8 +3,10 @@ package cs2
+ import (
+ 	"bufio"
+ 	"bytes"
++	"context"
+ 	"encoding/binary"
+ 	"fmt"
++	"github.com/AlexxIT/go2rtc/pkg/tcp"
+ 	"io"
+ 	"net"
+ 	"sync"
+@@ -13,7 +15,11 @@ import (
+ )
+ 
+ func Dial(host, transport string) (*Conn, error) {
+-	conn, err := handshake(host, transport)
++	return DialContext(context.Background(), host, transport)
++}
++
++func DialContext(ctx context.Context, host, transport string) (*Conn, error) {
++	conn, err := handshakeContext(ctx, host, transport)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -42,7 +48,7 @@ type Conn struct {
+ 	channels [4]*dataChannel
+ 
+ 	cmdMu  sync.Mutex
+-	cmdAck func()
++	cmdAck atomic.Pointer[chan struct{}] // ACK reader never waits on cmdMu
+ }
+ 
+ const (
+@@ -61,11 +67,17 @@ const (
+ 	msgCloseAck  = 0xF1
+ )
+ 
+-func handshake(host, transport string) (net.Conn, error) {
+-	conn, err := newUDPConn(host, 32108)
++func handshakeContext(ctx context.Context, host, transport string) (net.Conn, error) {
++	conn, err := newUDPConnContext(ctx, host, 32108)
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	stopCancel := context.AfterFunc(ctx, func() { _ = conn.Close() })
++	defer stopCancel()
++	if ctx.Err() != nil {
++		_ = conn.Close()
++		return nil, ctx.Err()
++	}
+ 
+ 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+ 
+@@ -100,7 +112,7 @@ func handshake(host, transport string) (net.Conn, error) {
+ 	if res[1] == msgTCP {
+ 		_ = conn.Close()
+ 		//host := fmt.Sprintf("%d.%d.%d.%d:%d", b[31], b[30], b[29], b[28], uint16(b[27])<<8|uint16(b[26]))
+-		return newTCPConn(conn.RemoteAddr().String())
++		return newTCPConnContext(ctx, conn.RemoteAddr().String())
+ 	}
+ 
+ 	return conn, nil
+@@ -174,8 +186,11 @@ func (c *Conn) worker() {
+ 			_, _ = c.Conn.Write([]byte{magic, msgPong, 0, 0})
+ 		case msgPong, msgP2PRdyUDP, msgP2PRdyTCP, msgClose, msgCloseAck: // skip it
+ 		case msgDrwAck: // only for UDP
+-			if c.cmdAck != nil {
+-				c.cmdAck()
++			if ack := c.cmdAck.Load(); ack != nil {
++				select {
++				case *ack <- struct{}{}:
++				default:
++				}
+ 			}
+ 		default:
+ 			fmt.Printf("%s: unknown msg: %x\n", "cs2", buf[:n])
+@@ -226,30 +241,23 @@ func (c *Conn) WriteCommand(cmd uint32, data []byte) error {
+ 		return err
+ 	}
+ 
+-	var repeat atomic.Int32
+-	repeat.Store(5)
+-
++	ack := make(chan struct{}, 1)
++	c.cmdAck.Store(&ack)
++	defer c.cmdAck.Store(nil)
+ 	timeout := time.NewTicker(time.Second)
+ 	defer timeout.Stop()
+ 
+-	c.cmdAck = func() {
+-		repeat.Store(0)
+-		timeout.Reset(1)
+-	}
+-
+-	for {
++	for attempt := 0; attempt < 5; attempt++ {
+ 		if _, err := c.Conn.Write(req); err != nil {
+ 			return err
+ 		}
+-		<-timeout.C
+-		r := repeat.Add(-1)
+-		if r < 0 {
++		select {
++		case <-ack:
+ 			return nil
+-		}
+-		if r == 0 {
+-			return fmt.Errorf("%s: can't send command %d", "cs2", cmd)
++		case <-timeout.C:
+ 		}
+ 	}
++	return fmt.Errorf("%s: can't send command %d", "cs2", cmd)
+ }
+ 
+ const hdrSize = 32
+@@ -312,16 +320,15 @@ func marshalCmd(channel byte, seq uint16, cmd uint32, payload []byte) []byte {
+ 	return req
+ }
+ 
+-func newUDPConn(host string, port int) (net.Conn, error) {
+-	// We using raw net.UDPConn, because RemoteAddr should be changed during handshake.
+-	conn, err := net.ListenUDP("udp", nil)
++func newUDPConnContext(ctx context.Context, host string, port int) (net.Conn, error) {
++	addr, err := tcp.ResolveUDPContext(ctx, host, port)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-
+-	addr, err := net.ResolveUDPAddr("udp", host)
++	// We using raw net.UDPConn, because RemoteAddr should be changed during handshake.
++	conn, err := net.ListenUDP("udp", nil)
+ 	if err != nil {
+-		addr = &net.UDPAddr{IP: net.ParseIP(host), Port: port}
++		return nil, err
+ 	}
+ 
+ 	return &udpConn{UDPConn: conn, addr: addr}, nil
+@@ -388,8 +395,8 @@ func sameIP(a, b net.IP) bool {
+ 	return a.Equal(b)
+ }
+ 
+-func newTCPConn(addr string) (net.Conn, error) {
+-	conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
++func newTCPConnContext(ctx context.Context, addr string) (net.Conn, error) {
++	conn, err := (&net.Dialer{Timeout: 3 * time.Second}).DialContext(ctx, "tcp", addr)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+diff --git a/pkg/xiaomi/miss/producer.go b/pkg/xiaomi/miss/producer.go
+index eeaa496..5f17890 100644
+--- a/pkg/xiaomi/miss/producer.go
++++ b/pkg/xiaomi/miss/producer.go
+@@ -1,6 +1,7 @@
+ package miss
+ 
+ import (
++	"context"
+ 	"fmt"
+ 	"net/url"
+ 	"time"
+@@ -14,14 +15,30 @@ import (
+ 
+ type Producer struct {
+ 	core.Connection
+-	client *Client
++	client           *Client
++	stopCancellation func() bool
+ }
+ 
+ func Dial(rawURL string) (core.Producer, error) {
+-	client, err := NewClient(rawURL)
++	return DialContext(context.Background(), rawURL)
++}
++
++func DialContext(ctx context.Context, rawURL string) (core.Producer, error) {
++	client, err := NewClientContext(ctx, rawURL)
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	stopCancel := context.AfterFunc(ctx, func() { _ = client.Close() })
++	prepared := false
++	defer func() {
++		if !prepared {
++			stopCancel()
++		}
++	}()
++	if ctx.Err() != nil {
++		_ = client.Close()
++		return nil, ctx.Err()
++	}
+ 
+ 	u, _ := url.Parse(rawURL)
+ 	query := u.Query()
+@@ -38,6 +55,7 @@ func Dial(rawURL string) (core.Producer, error) {
+ 		return nil, err
+ 	}
+ 
++	prepared = true
+ 	return &Producer{
+ 		Connection: core.Connection{
+ 			ID:         core.NewID(),
+@@ -48,7 +66,8 @@ func Dial(rawURL string) (core.Producer, error) {
+ 			Medias:     medias,
+ 			Transport:  client,
+ 		},
+-		client: client,
++		client:           client,
++		stopCancellation: stopCancel,
+ 	}, nil
+ }
+ 
+@@ -61,7 +80,7 @@ func probe(client *Client, audio bool) ([]*core.Media, error) {
+ 		pkt, err := client.ReadPacket()
+ 		if err != nil {
+ 			if vcodec != nil {
+-				err = fmt.Errorf("no audio")
++				err = core.ErrNoAudio
+ 			} else if acodec != nil {
+ 				err = fmt.Errorf("no video")
+ 			}
+@@ -84,11 +103,11 @@ func probe(client *Client, audio bool) ([]*core.Media, error) {
+ 				}
+ 			}
+ 		case codecPCMA:
+-			if acodec == nil {
++			if audio && acodec == nil {
+ 				acodec = &core.Codec{Name: core.CodecPCMA, ClockRate: 8000}
+ 			}
+ 		case codecOPUS:
+-			if acodec == nil {
++			if audio && acodec == nil {
+ 				acodec = &core.Codec{Name: core.CodecOpus, ClockRate: 48000, Channels: 2}
+ 			}
+ 		}
+@@ -194,6 +213,9 @@ func (p *Producer) Start() error {
+ }
+ 
+ func (p *Producer) Stop() error {
++	if p.stopCancellation != nil {
++		defer p.stopCancellation()
++	}
+ 	_ = p.client.StopMedia()
+ 	return p.Connection.Stop()
+ }
+diff --git a/pkg/xiaomi/producer.go b/pkg/xiaomi/producer.go
+index d0290f2..d6ef669 100644
+--- a/pkg/xiaomi/producer.go
++++ b/pkg/xiaomi/producer.go
+@@ -1,7 +1,9 @@
+ package xiaomi
+ 
+ import (
+-	"strings"
++	"context"
++	"encoding/json"
++	"net/url"
+ 
+ 	"github.com/AlexxIT/go2rtc/pkg/core"
+ 	"github.com/AlexxIT/go2rtc/pkg/xiaomi/legacy"
+@@ -9,15 +11,86 @@ import (
+ )
+ 
+ func Dial(rawURL string) (core.Producer, error) {
++	return DialContext(context.Background(), rawURL, func(bool) {})
++}
++
++// The resolved transport is the only authority for audio control. Report before
++// dialing/probing so a camera with missing audio can still be muted and retried.
++func DialContext(ctx context.Context, rawURL string, report func(bool)) (core.PreparedProducer, error) {
++	u, err := url.Parse(rawURL)
++	if err != nil {
++		return nil, err
++	}
++	isMISS := u.Query().Has("vendor")
++	audioControl := isMISS || legacy.AudioControlSupported(u.Query().Get("model"))
++	report(audioControl)
++	var source core.Producer
+ 	// Format: xiaomi/miss
+-	if strings.Contains(rawURL, "vendor") {
+-		return miss.Dial(rawURL)
++	if isMISS {
++		source, err = miss.DialContext(ctx, rawURL)
++	} else {
++		// Format: xiaomi/legacy
++		source, err = legacy.DialContext(ctx, rawURL)
++	}
++	if err != nil {
++		return nil, err
+ 	}
++	prepared, err := prepareSource(source, audioControl)
++	if err != nil {
++		_ = source.Stop()
++	}
++	return prepared, err
++}
+ 
+-	// Format: xiaomi/legacy
+-	return legacy.Dial(rawURL)
++// Both Xiaomi transports use the same immutable receive-track preparation.
++// The product exposes camera input only; no speaker/backchannel media or writer
++// interface is exported by this source.
++type preparedSource struct {
++	core.Producer
++	medias    []*core.Media
++	receivers []*core.Receiver
+ }
+ 
++func prepareSource(source core.Producer, audioControl bool) (*preparedSource, error) {
++	p := &preparedSource{Producer: source}
++	for _, media := range source.GetMedias() {
++		if media.Direction != core.DirectionRecvonly {
++			continue
++		}
++		// Uncontrollable legacy cameras keep their existing upstream behavior,
++		// but do not advertise an audio track the product cannot mute.
++		if media.Kind == core.KindAudio && !audioControl {
++			continue
++		}
++		for _, codec := range media.Codecs {
++			if media.Kind == core.KindAudio && codec.Name != core.CodecPCMA && codec.Name != core.CodecOpus {
++				return nil, core.ErrNoAudio
++			}
++			track, err := source.GetTrack(media, codec)
++			if err != nil {
++				return nil, err
++			}
++			p.receivers = append(p.receivers, track)
++		}
++		p.medias = append(p.medias, media)
++	}
++	return p, nil
++}
++
++func (p *preparedSource) GetMedias() []*core.Media            { return p.medias }
++func (p *preparedSource) PreparedReceivers() []*core.Receiver { return p.receivers }
++func (p *preparedSource) GetTrack(media *core.Media, codec *core.Codec) (*core.Receiver, error) {
++	for _, track := range p.receivers {
++		if track.Media == media && track.Codec == codec {
++			return track, nil
++		}
++	}
++	return nil, core.ErrCantGetTrack
++}
++func (p *preparedSource) MarshalJSON() ([]byte, error) { return json.Marshal(p.Producer) }
++
++var _ core.PreparedProducer = (*preparedSource)(nil)
++
+ func IsLegacy(model string) bool {
+ 	return legacy.Supported(model)
+ }

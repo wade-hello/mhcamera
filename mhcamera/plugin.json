@@ -1,0 +1,13 @@
+{
+  "id": "mhcamera",
+  "version": "1.0.5",
+  "upgrade_url": "",
+  "name": {
+    "zh": "米家摄像头",
+    "en": "Mi Camera"
+  },
+  "description": {
+    "zh": "基于 go2rtc 的米家摄像头接入插件",
+    "en": "Mi camera integration plugin based on go2rtc"
+  }
+}

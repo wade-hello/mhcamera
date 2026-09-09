@@ -1,0 +1,877 @@
+diff --git a/internal/xiaomi/phone_bootstrap.go b/internal/xiaomi/phone_bootstrap.go
+index e69de29..127c9de 100644
+--- a/internal/xiaomi/phone_bootstrap.go
++++ b/internal/xiaomi/phone_bootstrap.go
+@@ -0,0 +1,864 @@
++package xiaomi
++
++import (
++	"bytes"
++	"crypto/aes"
++	"crypto/cipher"
++	"crypto/rand"
++	"crypto/rsa"
++	"crypto/sha256"
++	"crypto/x509"
++	"encoding/base64"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"math/big"
++	"net/http"
++	"net/http/cookiejar"
++	"net/url"
++	"regexp"
++	"strconv"
++	"strings"
++	"sync"
++	"time"
++
++	"github.com/AlexxIT/go2rtc/internal/api"
++	"github.com/AlexxIT/go2rtc/internal/app"
++	xiaomicloud "github.com/AlexxIT/go2rtc/pkg/xiaomi"
++)
++
++var errPhoneInput = errors.New("invalid phone input")
++
++const (
++	passportBaseURL       = "https://account.xiaomi.com"
++	passportSessionID     = "passport"
++	passportLocale        = "zh_CN"
++	passportCallback      = "https://account.xiaomi.com"
++	passportQS            = "%3Fsid%3Dpassport"
++	passportPhoneReferer  = "https://account.xiaomi.com/fe/service/login/phone"
++	passportUserAgent     = "Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"
++	phoneSessionLifetime  = 10 * time.Minute
++	passportResponseLimit = 1 << 20
++)
++
++var passportPolicyName = regexp.MustCompile(`window\.region="([A-Za-z0-9_-]+)"`)
++
++// The DER is the fixed Xiaomi web EUI encryption key used by the Passport page.
++const xiaomiEUIPublicKeyDER = "MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQCYEVrK/4Mahiv0pUJgTybx4J9P5dUT/Y0PuwMbk+gMU+jrZnBiXGv6/hCH1avIhoBcE535F8nJQQN3UavZdFkYidsoXuEnat3+eVTp3FslyhRwIBDF09v4vDhRtxFOT+R7uH7h/mzmyA2/+lfIMWGIrffXprYizbV76+YQKhoqFQIDAQAB"
++
++type phoneTokenAuthenticator func(userID, candidatePassToken string) (*xiaomicloud.Cloud, string, string, error)
++
++type phoneDependencies struct {
++	passportBase   string
++	transport      http.RoundTripper
++	randomDeviceID func() (string, error)
++	authenticate   phoneTokenAuthenticator
++	patchToken     func([]string, any) error
++	timeout        time.Duration
++}
++
++type phoneBootstrap struct {
++	mu sync.Mutex
++
++	passportBase   string
++	transport      http.RoundTripper
++	randomDeviceID func() (string, error)
++	authenticate   phoneTokenAuthenticator
++	patchToken     func([]string, any) error
++	timeout        time.Duration
++
++	session *phoneSession
++}
++
++type phoneSession struct {
++	client *http.Client
++	jar    http.CookieJar
++
++	deviceID       string
++	callingCode    string
++	nationalNumber string
++	passportUser   string
++	policyName     string
++	codeLength     int
++	retryAfter     int
++	state          string
++
++	timer *time.Timer
++}
++
++type phoneResponse struct {
++	State             string `json:"state"`
++	MaskedTarget      string `json:"masked_target,omitempty"`
++	CodeLength        int    `json:"code_length,omitempty"`
++	RetryAfterSeconds int    `json:"retry_after_seconds,omitempty"`
++	Error             string `json:"error,omitempty"`
++	ProviderCode      int    `json:"provider_code,omitempty"`
++}
++
++type phoneFailure struct {
++	category     string
++	status       int
++	providerCode int
++}
++
++type passportResponse struct {
++	Code      *int            `json:"code"`
++	Data      json.RawMessage `json:"data"`
++	Location  string          `json:"location"`
++	UserID    passportUserID  `json:"userId"`
++	PassToken string          `json:"passToken"`
++}
++
++type passportUserID string
++
++func (id *passportUserID) UnmarshalJSON(data []byte) error {
++	var value string
++	if len(data) != 0 && data[0] == '"' {
++		if err := json.Unmarshal(data, &value); err != nil {
++			return err
++		}
++	} else {
++		value = string(data)
++	}
++	if !onlyASCIIDigits(value) {
++		return errPhoneInput
++	}
++	value = strings.TrimLeft(value, "0")
++	if value == "" {
++		value = "0"
++	}
++	*id = passportUserID(value)
++	return nil
++}
++
++func (e *phoneFailure) Error() string { return e.category }
++
++func phoneFail(category string, status int) error {
++	return &phoneFailure{category: category, status: status}
++}
++
++func phoneProviderFail(category string, status, providerCode int) error {
++	return &phoneFailure{category: category, status: status, providerCode: providerCode}
++}
++
++func newPhoneBootstrap(deps phoneDependencies) *phoneBootstrap {
++	if deps.passportBase == "" {
++		deps.passportBase = passportBaseURL
++	}
++	if deps.randomDeviceID == nil {
++		deps.randomDeviceID = randomPhoneDeviceID
++	}
++	if deps.authenticate == nil {
++		deps.authenticate = authenticatePhoneToken
++	}
++	if deps.patchToken == nil {
++		deps.patchToken = app.PatchConfig
++	}
++	if deps.timeout == 0 {
++		deps.timeout = phoneSessionLifetime
++	}
++	return &phoneBootstrap{
++		passportBase:   strings.TrimRight(deps.passportBase, "/"),
++		transport:      deps.transport,
++		randomDeviceID: deps.randomDeviceID,
++		authenticate:   deps.authenticate,
++		patchToken:     deps.patchToken,
++		timeout:        deps.timeout,
++	}
++}
++
++func (p *phoneBootstrap) serveHTTP(w http.ResponseWriter, r *http.Request) {
++	if r.Method != http.MethodPost || !strings.HasPrefix(r.Header.Get("Content-Type"), "application/x-www-form-urlencoded") || r.ParseForm() != nil {
++		phoneErrorResponse(w, http.StatusBadRequest, "input")
++		return
++	}
++
++	p.mu.Lock()
++	defer p.mu.Unlock()
++
++	var (
++		response phoneResponse
++		err      error
++	)
++	switch r.Form.Get("action") {
++	case "start":
++		if !onlyPhoneForm(r.Form, "action", "calling_code", "national_number") {
++			err = phoneFail("input", http.StatusBadRequest)
++			break
++		}
++		response, err = p.startLocked(r.Form.Get("calling_code"), r.Form.Get("national_number"))
++	case "verify":
++		if !onlyPhoneForm(r.Form, "action", "code") {
++			err = phoneFail("input", http.StatusBadRequest)
++			break
++		}
++		response, err = p.verifyLocked(r.Form.Get("code"))
++	case "resend":
++		if !onlyPhoneForm(r.Form, "action") {
++			err = phoneFail("input", http.StatusBadRequest)
++			break
++		}
++		response, err = p.sendLocked()
++	case "cancel":
++		if !onlyPhoneForm(r.Form, "action") {
++			err = phoneFail("input", http.StatusBadRequest)
++			break
++		}
++		p.clearSessionLocked(p.session)
++		response = phoneResponse{State: "idle"}
++	default:
++		err = phoneFail("input", http.StatusBadRequest)
++	}
++
++	if err != nil {
++		var failure *phoneFailure
++		if !errors.As(err, &failure) {
++			failure = &phoneFailure{category: "internal", status: http.StatusInternalServerError}
++		}
++		phoneErrorResponse(w, failure.status, failure.category, failure.providerCode)
++		return
++	}
++	api.ResponseJSON(w, response)
++}
++
++func phoneErrorResponse(w http.ResponseWriter, status int, category string, providerCode ...int) {
++	_ = status
++	code := 0
++	if len(providerCode) == 1 {
++		code = providerCode[0]
++	}
++	api.ResponseJSON(w, phoneResponse{State: "error", Error: category, ProviderCode: code})
++}
++
++func onlyPhoneForm(form url.Values, keys ...string) bool {
++	if len(form) != len(keys) {
++		return false
++	}
++	for _, key := range keys {
++		if len(form[key]) != 1 {
++			return false
++		}
++	}
++	return true
++}
++
++func (p *phoneBootstrap) startLocked(callingCode, nationalNumber string) (phoneResponse, error) {
++	if p.session != nil || phoneAccountConfigured() {
++		return phoneResponse{}, phoneFail("input", http.StatusConflict)
++	}
++	passportUser, err := normalizePassportUser(callingCode, nationalNumber)
++	if err != nil {
++		return phoneResponse{}, phoneFail("input", http.StatusBadRequest)
++	}
++	session, err := p.newSession(callingCode, strings.TrimSpace(nationalNumber), passportUser)
++	if err != nil {
++		return phoneResponse{}, phoneFail("internal", http.StatusInternalServerError)
++	}
++	p.session = session
++
++	if err := p.loadPolicyLocked(session); err != nil {
++		p.clearSessionLocked(session)
++		return phoneResponse{}, err
++	}
++	if err := p.requestTicketModeLocked(session); err != nil {
++		p.clearSessionLocked(session)
++		return phoneResponse{}, err
++	}
++	response, err := p.sendForSessionLocked(session)
++	if err != nil {
++		p.clearSessionLocked(session)
++	}
++	return response, err
++}
++
++func (p *phoneBootstrap) newSession(callingCode, nationalNumber, passportUser string) (*phoneSession, error) {
++	jar, err := cookiejar.New(nil)
++	if err != nil {
++		return nil, err
++	}
++	deviceID, err := p.randomDeviceID()
++	if err != nil || deviceID == "" {
++		return nil, errPhoneInput
++	}
++	base, err := url.Parse(p.passportBase)
++	if err != nil || base.Scheme != "https" || base.Host == "" {
++		return nil, errPhoneInput
++	}
++	jar.SetCookies(base, []*http.Cookie{
++		{Name: "deviceId", Value: deviceID, Path: "/", Secure: true},
++		{Name: "uLocale", Value: passportLocale, Path: "/", Secure: true},
++		{Name: "pass_ua", Value: "web", Path: "/", Secure: true},
++		{Name: "pass_ptd", Value: "1", Path: "/", Secure: true},
++		{Name: "passInfo", Value: "login-end", Path: "/", Secure: true},
++	})
++	client := &http.Client{
++		Jar:       jar,
++		Timeout:   15 * time.Second,
++		Transport: p.transport,
++		CheckRedirect: func(req *http.Request, _ []*http.Request) error {
++			if !trustedXiaomiURL(req.URL) {
++				return errPhoneInput
++			}
++			return nil
++		},
++	}
++	return &phoneSession{
++		client:         client,
++		jar:            jar,
++		deviceID:       deviceID,
++		callingCode:    callingCode,
++		nationalNumber: nationalNumber,
++		passportUser:   passportUser,
++		state:          "sending_sms",
++	}, nil
++}
++
++func (p *phoneBootstrap) loadPolicyLocked(session *phoneSession) error {
++	body, err := p.do(session, http.MethodGet, "/fe/service/login/phone?_locale="+passportLocale, nil, "")
++	if err != nil {
++		return err
++	}
++	match := passportPolicyName.FindSubmatch(body)
++	if len(match) != 2 || len(match[1]) == 0 {
++		return phoneFail("protocol", http.StatusBadGateway)
++	}
++	region := strings.ToLower(string(match[1]))
++	if strings.Contains(region, "cnbj") || strings.Contains(region, "staging") {
++		session.policyName = "miaccount"
++	} else {
++		session.policyName = "globalmiaccount"
++	}
++	return nil
++}
++
++func (p *phoneBootstrap) requestTicketModeLocked(session *phoneSession) error {
++	phone, eui, err := encryptPhoneField("phone", session.passportUser)
++	if err != nil {
++		return phoneFail("internal", http.StatusInternalServerError)
++	}
++	body, err := p.do(session, http.MethodPost, "/pass/preference", url.Values{"phone": {phone}}, eui)
++	if err != nil {
++		return err
++	}
++	response, err := decodePassportResponse(body)
++	if err != nil {
++		return err
++	}
++	if response.Code == nil {
++		return phoneFail("protocol", http.StatusBadGateway)
++	}
++	if *response.Code != 0 {
++		return mapPassportCode(*response.Code)
++	}
++	var data struct {
++		Type string `json:"type"`
++	}
++	if json.Unmarshal(response.Data, &data) != nil || data.Type != "ticket" {
++		return phoneFail("protocol", http.StatusBadGateway)
++	}
++	return nil
++}
++
++func (p *phoneBootstrap) sendLocked() (phoneResponse, error) {
++	if p.session == nil || p.session.state != "sms_required" {
++		return phoneResponse{}, phoneFail("input", http.StatusConflict)
++	}
++	return p.sendForSessionLocked(p.session)
++}
++
++func (p *phoneBootstrap) sendForSessionLocked(session *phoneSession) (phoneResponse, error) {
++	user, eui, err := encryptPhoneField("user", session.passportUser)
++	if err != nil {
++		return phoneResponse{}, phoneFail("internal", http.StatusInternalServerError)
++	}
++	form := url.Values{
++		"sid":      {passportSessionID},
++		"user":     {user},
++		"captCode": {""},
++	}
++	body, err := p.do(session, http.MethodPost, "/pass/sendServiceLoginTicket", form, eui)
++	if err != nil {
++		return phoneResponse{}, err
++	}
++	response, err := decodePassportResponse(body)
++	if err != nil {
++		return phoneResponse{}, err
++	}
++	if response.Code == nil {
++		return phoneResponse{}, phoneFail("protocol", http.StatusBadGateway)
++	}
++	if *response.Code != 0 {
++		return phoneResponse{}, mapPassportCode(*response.Code)
++	}
++	var data struct {
++		VCodeLen int         `json:"vCodeLen"`
++		WT       json.Number `json:"wt"`
++	}
++	if err := json.Unmarshal(response.Data, &data); err != nil {
++		return phoneResponse{}, phoneFail("protocol", http.StatusBadGateway)
++	}
++	wait, err := parseWait(data.WT)
++	if err != nil || data.VCodeLen <= 0 {
++		return phoneResponse{}, phoneFail("protocol", http.StatusBadGateway)
++	}
++	session.state = "sms_required"
++	session.codeLength = data.VCodeLen
++	session.retryAfter = wait
++	p.armSessionTimerLocked(session)
++	return phoneResponse{
++		State:             session.state,
++		MaskedTarget:      maskedPhoneTarget(session.nationalNumber),
++		CodeLength:        data.VCodeLen,
++		RetryAfterSeconds: wait,
++	}, nil
++}
++
++func (p *phoneBootstrap) verifyLocked(code string) (phoneResponse, error) {
++	session := p.session
++	if session == nil || session.state != "sms_required" || len(code) != session.codeLength || !onlyASCIIDigits(code) {
++		return phoneResponse{}, phoneFail("input", http.StatusBadRequest)
++	}
++	session.state = "verifying"
++	if err := p.phoneInfoLocked(session, code); err != nil {
++		p.clearSessionLocked(session)
++		return phoneResponse{}, err
++	}
++	if !hasCookie(session.jar, p.passportBase, "ticketToken") {
++		p.clearSessionLocked(session)
++		return phoneResponse{}, phoneFail("phone_info_ticket_token_missing", http.StatusBadGateway)
++	}
++	userID, candidateToken, err := p.ticketAuthLocked(session, code)
++	if err != nil {
++		p.clearSessionLocked(session)
++		return phoneResponse{}, err
++	}
++
++	// The Passport jar is dropped before native XiaomiIO token login. Only the
++	// candidate pair crosses this boundary.
++	session.clearPassport()
++	cloud, rotatedUserID, rotatedToken, err := p.authenticate(userID, candidateToken)
++	candidateToken = ""
++	if err != nil || rotatedUserID == "" || rotatedToken == "" {
++		p.clearSessionLocked(session)
++		return phoneResponse{}, phoneFail("xiaomi_token_response_invalid", http.StatusBadGateway)
++	}
++	if err = p.patchToken([]string{"xiaomi", rotatedUserID}, rotatedToken); err != nil {
++		p.clearSessionLocked(session)
++		return phoneResponse{}, phoneFail("internal", http.StatusInternalServerError)
++	}
++
++	cloudsMu.Lock()
++	if tokens == nil {
++		tokens = map[string]string{}
++	}
++	tokens[rotatedUserID] = rotatedToken
++	if cloud != nil {
++		if clouds == nil {
++			clouds = map[string]*xiaomicloud.Cloud{}
++		}
++		clouds[rotatedUserID] = cloud
++	}
++	cloudsMu.Unlock()
++	p.clearSessionLocked(session)
++	return phoneResponse{State: "authenticated"}, nil
++}
++
++func (p *phoneBootstrap) phoneInfoLocked(session *phoneSession, code string) error {
++	form := url.Values{
++		"sid":        {passportSessionID},
++		"user":       {session.passportUser},
++		"ticket":     {code},
++		"policyName": {session.policyName},
++	}
++	referer := p.ticketReferer(session)
++	body, err := p.do(session, http.MethodPost, "/pass/phoneInfo", form, "", referer)
++	if err != nil {
++		return err
++	}
++	response, err := decodePassportResponse(body)
++	if err != nil {
++		return phoneFail("phone_info_response_invalid", http.StatusBadGateway)
++	}
++	if response.Code == nil {
++		return phoneFail("phone_info_response_invalid", http.StatusBadGateway)
++	}
++	if *response.Code != 0 {
++		return mapPassportCode(*response.Code)
++	}
++	var data struct {
++		Status *int `json:"status"`
++	}
++	if json.Unmarshal(response.Data, &data) != nil {
++		return phoneFail("phone_info_response_invalid", http.StatusBadGateway)
++	}
++	if data.Status == nil {
++		return phoneFail("phone_info_response_invalid", http.StatusBadGateway)
++	}
++	if *data.Status != 2 {
++		return phoneFail("phone_account_not_found", http.StatusUnauthorized)
++	}
++	return nil
++}
++
++func (p *phoneBootstrap) ticketAuthLocked(session *phoneSession, code string) (string, string, error) {
++	fingerprint, err := deviceFingerprint()
++	if err != nil {
++		return "", "", phoneFail("internal", http.StatusInternalServerError)
++	}
++	form := url.Values{
++		"callback":          {passportCallback},
++		"sid":               {passportSessionID},
++		"qs":                {passportQS},
++		"serviceParam":      {""},
++		"_sign":             {""},
++		"user":              {session.passportUser},
++		"ticket":            {code},
++		"_json":             {"true"},
++		"_locale":           {passportLocale},
++		"deviceFingerprint": {fingerprint},
++	}
++	referer := p.ticketReferer(session)
++	body, err := p.do(session, http.MethodPost, "/pass/serviceLoginTicketAuth", form, "", referer)
++	if err != nil {
++		return "", "", err
++	}
++	response, err := decodePassportResponse(body)
++	if err != nil {
++		return "", "", phoneFail("ticket_auth_json_invalid", http.StatusBadGateway)
++	}
++	if response.Code == nil {
++		return "", "", phoneFail("ticket_auth_code_missing", http.StatusBadGateway)
++	}
++	if *response.Code != 0 {
++		return "", "", mapPassportCode(*response.Code)
++	}
++	if response.Location == "" {
++		return "", "", phoneFail("ticket_auth_location_missing", http.StatusBadGateway)
++	}
++	location, err := url.Parse(response.Location)
++	if err != nil || !trustedXiaomiURL(location) {
++		return "", "", phoneFail("ticket_auth_location_invalid", http.StatusBadGateway)
++	}
++	if response.Location != "" {
++		req, err := http.NewRequest(http.MethodGet, response.Location, nil)
++		if err != nil {
++			return "", "", phoneFail("ticket_auth_location_invalid", http.StatusBadGateway)
++		}
++		setPassportWebHeaders(req, false)
++		res, err := session.client.Do(req)
++		if err != nil {
++			return "", "", phoneFail("network", http.StatusBadGateway)
++		}
++		_, _ = io.Copy(io.Discard, io.LimitReader(res.Body, passportResponseLimit))
++		_ = res.Body.Close()
++		if res.StatusCode < http.StatusOK || res.StatusCode >= http.StatusMultipleChoices {
++			return "", "", phoneFail("passport_location_rejected", http.StatusBadGateway)
++		}
++	}
++
++	userID, passToken := string(response.UserID), response.PassToken
++	if value := cookieValue(session.jar, p.passportBase, "userId"); value != "" {
++		userID = value
++	}
++	if value := cookieValue(session.jar, p.passportBase, "passToken"); value != "" {
++		passToken = value
++	}
++	if userID == "" || passToken == "" {
++		return "", "", phoneFail("passport_token_missing", http.StatusBadGateway)
++	}
++	return userID, passToken, nil
++}
++
++func (p *phoneBootstrap) do(session *phoneSession, method, path string, form url.Values, eui string, referer ...string) ([]byte, error) {
++	if session == nil || session.client == nil {
++		return nil, phoneFail("internal", http.StatusInternalServerError)
++	}
++	u := p.passportBase + path
++	var body io.Reader
++	if form != nil {
++		body = strings.NewReader(form.Encode())
++	}
++	req, err := http.NewRequest(method, u, body)
++	if err != nil {
++		return nil, phoneFail("internal", http.StatusInternalServerError)
++	}
++	setPassportWebHeaders(req, form != nil)
++	if eui != "" {
++		req.Header.Set("EUI", eui)
++	}
++	if len(referer) != 0 {
++		req.Header.Set("Referer", referer[0])
++	}
++	res, err := session.client.Do(req)
++	if err != nil {
++		return nil, phoneFail("network", http.StatusBadGateway)
++	}
++	defer res.Body.Close()
++	bodyBytes, readErr := io.ReadAll(io.LimitReader(res.Body, passportResponseLimit+1))
++	if readErr != nil || len(bodyBytes) > passportResponseLimit {
++		return nil, phoneFail("protocol", http.StatusBadGateway)
++	}
++	if res.StatusCode < http.StatusOK || res.StatusCode >= http.StatusMultipleChoices {
++		return nil, phoneFail("provider", http.StatusBadGateway)
++	}
++	return bodyBytes, nil
++}
++
++func setPassportWebHeaders(req *http.Request, form bool) {
++	req.Header.Set("Accept", "application/json, text/plain, */*")
++	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9")
++	req.Header.Set("Cache-Control", "no-cache")
++	req.Header.Set("Origin", passportBaseURL)
++	req.Header.Set("Pragma", "no-cache")
++	req.Header.Set("Referer", passportPhoneReferer)
++	req.Header.Set("X-Requested-With", "XMLHttpRequest")
++	req.Header.Set("User-Agent", passportUserAgent)
++	if form {
++		req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
++	}
++}
++
++func (p *phoneBootstrap) ticketReferer(session *phoneSession) string {
++	return p.passportBase + "/fe/service/login/challenge/ticket?_locale=" + passportLocale +
++		"&_callingCode=" + url.QueryEscape(session.callingCode) +
++		"&_user=" + url.QueryEscape(session.passportUser) +
++		"&_agreementChecked=true"
++}
++
++func (p *phoneBootstrap) armSessionTimerLocked(session *phoneSession) {
++	if session.timer != nil {
++		session.timer.Stop()
++	}
++	session.timer = time.AfterFunc(p.timeout, func() {
++		p.mu.Lock()
++		defer p.mu.Unlock()
++		p.clearSessionLocked(session)
++	})
++}
++
++func (p *phoneBootstrap) clearSessionLocked(session *phoneSession) {
++	if session == nil || p.session != session {
++		return
++	}
++	if session.timer != nil {
++		session.timer.Stop()
++		session.timer = nil
++	}
++	session.clearPassport()
++	session.deviceID = ""
++	session.codeLength = 0
++	session.retryAfter = 0
++	session.state = ""
++	p.session = nil
++}
++
++func (session *phoneSession) clearPassport() {
++	session.client = nil
++	session.jar = nil
++	session.deviceID = ""
++	session.callingCode = ""
++	session.nationalNumber = ""
++	session.passportUser = ""
++	session.policyName = ""
++}
++
++func decodePassportResponse(body []byte) (passportResponse, error) {
++	const start = "&&&START&&&"
++	if bytes.HasPrefix(body, []byte(start)) {
++		body = body[len(start):]
++	}
++	var response passportResponse
++	if err := json.Unmarshal(body, &response); err != nil {
++		return response, phoneFail("protocol", http.StatusBadGateway)
++	}
++	return response, nil
++}
++
++func mapPassportCode(code int) error {
++	switch code {
++	case 70022:
++		return phoneProviderFail("sms_send_limit_tomorrow", http.StatusTooManyRequests, code)
++	case 70016, 70017, 70018:
++		return phoneProviderFail("sms_code_invalid_or_expired", http.StatusUnauthorized, code)
++	case 70069, 70070:
++		return phoneProviderFail("additional_verification_required", http.StatusUnauthorized, code)
++	default:
++		return phoneProviderFail("provider", http.StatusBadGateway, code)
++	}
++}
++
++func parseWait(value json.Number) (int, error) {
++	if value == "" {
++		return 0, errPhoneInput
++	}
++	parsed, err := strconv.ParseInt(string(value), 10, 32)
++	if err != nil || parsed < 0 {
++		return 0, errPhoneInput
++	}
++	return int(parsed), nil
++}
++
++func phoneAccountConfigured() bool {
++	cloudsMu.Lock()
++	defer cloudsMu.Unlock()
++	return len(tokens) != 0
++}
++
++func hasCookie(jar http.CookieJar, base, name string) bool {
++	return cookieValue(jar, base, name) != ""
++}
++
++func cookieValue(jar http.CookieJar, base, name string) string {
++	if jar == nil {
++		return ""
++	}
++	u, err := url.Parse(base)
++	if err != nil {
++		return ""
++	}
++	for _, cookie := range jar.Cookies(u) {
++		if cookie.Name == name {
++			return cookie.Value
++		}
++	}
++	return ""
++}
++
++func trustedXiaomiURL(u *url.URL) bool {
++	if u == nil || u.Scheme != "https" || u.User != nil || u.Fragment != "" {
++		return false
++	}
++	port := u.Port()
++	return strings.EqualFold(u.Hostname(), "account.xiaomi.com") && (port == "" || port == "443")
++}
++
++func onlyASCIIDigits(value string) bool {
++	if value == "" {
++		return false
++	}
++	for _, char := range value {
++		if char < '0' || char > '9' {
++			return false
++		}
++	}
++	return true
++}
++
++func randomPhoneDeviceID() (string, error) {
++	value := make([]byte, 16)
++	if _, err := rand.Read(value); err != nil {
++		return "", err
++	}
++	value[6] = value[6]&0x0f | 0x40
++	value[8] = value[8]&0x3f | 0x80
++	encoded := hex.EncodeToString(value)
++	return "wb_" + encoded[0:8] + "-" + encoded[8:12] + "-" + encoded[12:16] + "-" + encoded[16:20] + "-" + encoded[20:], nil
++}
++
++func randomPhoneEUIKey() (string, error) {
++	const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*"
++	var value strings.Builder
++	value.Grow(aes.BlockSize)
++	for range aes.BlockSize {
++		index, err := rand.Int(rand.Reader, bigInt(len(alphabet)))
++		if err != nil {
++			return "", err
++		}
++		value.WriteByte(alphabet[index.Int64()])
++	}
++	return value.String(), nil
++}
++
++func bigInt(value int) *big.Int { return big.NewInt(int64(value)) }
++
++func encryptPhoneField(name, value string) (string, string, error) {
++	key, err := randomPhoneEUIKey()
++	if err != nil {
++		return "", "", err
++	}
++	block, err := aes.NewCipher([]byte(key))
++	if err != nil {
++		return "", "", err
++	}
++	plain := pkcs7Pad([]byte(value), aes.BlockSize)
++	ciphertext := make([]byte, len(plain))
++	cipher.NewCBCEncrypter(block, []byte("0102030405060708")).CryptBlocks(ciphertext, plain)
++	der, err := base64.StdEncoding.DecodeString(xiaomiEUIPublicKeyDER)
++	if err != nil {
++		return "", "", err
++	}
++	parsed, err := x509.ParsePKIXPublicKey(der)
++	if err != nil {
++		return "", "", err
++	}
++	publicKey, ok := parsed.(*rsa.PublicKey)
++	if !ok {
++		return "", "", fmt.Errorf("unexpected EUI key")
++	}
++	wrapped, err := rsa.EncryptPKCS1v15(rand.Reader, publicKey, []byte(base64.StdEncoding.EncodeToString([]byte(key))))
++	if err != nil {
++		return "", "", err
++	}
++	eui := base64.StdEncoding.EncodeToString(wrapped) + "." + base64.StdEncoding.EncodeToString([]byte(name))
++	return base64.StdEncoding.EncodeToString(ciphertext), eui, nil
++}
++
++func deviceFingerprint() (string, error) {
++	seed := make([]byte, 32)
++	if _, err := rand.Read(seed); err != nil {
++		return "", err
++	}
++	sum := sha256.Sum256(seed)
++	return hex.EncodeToString(sum[:])[:32], nil
++}
++
++func maskedPhoneTarget(nationalNumber string) string {
++	if len(nationalNumber) < 4 {
++		return "****"
++	}
++	return "***" + nationalNumber[len(nationalNumber)-4:]
++}
++
++func pkcs7Pad(value []byte, blockSize int) []byte {
++	padding := blockSize - len(value)%blockSize
++	return append(value, bytes.Repeat([]byte{byte(padding)}, padding)...)
++}
++
++func authenticatePhoneToken(userID, candidatePassToken string) (*xiaomicloud.Cloud, string, string, error) {
++	cloud := xiaomicloud.NewCloud(AppXiaomiHome)
++	if err := cloud.LoginWithToken(userID, candidatePassToken); err != nil {
++		return nil, "", "", err
++	}
++	rotatedUserID, rotatedToken := cloud.UserToken()
++	if rotatedUserID == "" || rotatedToken == "" {
++		return nil, "", "", errPhoneInput
++	}
++	return cloud, rotatedUserID, rotatedToken, nil
++}
++
++func normalizePassportUser(callingCode, nationalNumber string) (string, error) {
++	nationalNumber = strings.TrimSpace(nationalNumber)
++	if len(callingCode) < 2 || len(callingCode) > 4 || callingCode[0] != '+' ||
++		callingCode[1] < '1' || callingCode[1] > '9' {
++		return "", errPhoneInput
++	}
++	for _, digit := range callingCode[2:] {
++		if digit < '0' || digit > '9' {
++			return "", errPhoneInput
++		}
++	}
++	if nationalNumber == "" || len(callingCode)-1+len(nationalNumber) > 15 {
++		return "", errPhoneInput
++	}
++	for _, digit := range nationalNumber {
++		if digit < '0' || digit > '9' {
++			return "", errPhoneInput
++		}
++	}
++	if callingCode == "+86" {
++		return nationalNumber, nil
++	}
++	return callingCode + nationalNumber, nil
++}
+diff --git a/internal/xiaomi/xiaomi.go b/internal/xiaomi/xiaomi.go
+index 1801fa8..41a1622 100644
+--- a/internal/xiaomi/xiaomi.go
++++ b/internal/xiaomi/xiaomi.go
+@@ -49,0 +50 @@ func Init() {
++	api.HandleFunc("api/xiaomi-phone", xiaomiPhoneAuth.serveHTTP)
+@@ -54,0 +56 @@ var cloudsMu sync.Mutex
++var xiaomiPhoneAuth = newPhoneBootstrap(phoneDependencies{})

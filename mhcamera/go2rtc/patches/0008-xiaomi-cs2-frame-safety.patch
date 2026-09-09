@@ -1,0 +1,128 @@
+diff --git a/pkg/xiaomi/miss/cs2/conn.go b/pkg/xiaomi/miss/cs2/conn.go
+--- a/pkg/xiaomi/miss/cs2/conn.go
++++ b/pkg/xiaomi/miss/cs2/conn.go
+@@ -121,6 +121,9 @@
+ 			c.err = fmt.Errorf("%s: %w", "cs2", err)
+ 			return
+ 		}
++		if n < 2 {
++			continue
++		}
+ 
+ 		// 0  f1d0  magic
+ 		// 2  005d  size = total size + 4
+@@ -129,7 +132,13 @@
+ 		// 6  0000  seq
+ 		switch buf[1] {
+ 		case msgDrw:
+-			ch := buf[5]
++			if n < 8 {
++				continue
++			}
++			ch := int(buf[5])
++			if ch >= len(c.channels) || c.channels[ch] == nil {
++				continue
++			}
+ 			channel := c.channels[ch]
+ 
+ 			if c.isTCP {
+@@ -150,7 +159,7 @@
+ 
+ 				if pushed >= 0 {
+ 					// For UDP we should send ACK.
+-					ack := []byte{magic, msgDrwAck, 0, 6, magicDrw, ch, 0, 1, seqHI, seqLO}
++					ack := []byte{magic, msgDrwAck, 0, 6, magicDrw, byte(ch), 0, 1, seqHI, seqLO}
+ 					_, _ = c.Conn.Write(ack)
+ 				}
+ 			}
+@@ -196,6 +205,9 @@
+ 	if !ok {
+ 		return 0, nil, c.Error()
+ 	}
++	if len(buf) < 4 {
++		return 0, nil, fmt.Errorf("cs2: command record too short: got %d bytes, need at least 4", len(buf))
++	}
+ 	cmd = binary.LittleEndian.Uint32(buf)
+ 	data = buf[4:]
+ 	return
+@@ -246,6 +258,9 @@
+ 	if !ok {
+ 		return nil, nil, c.Error()
+ 	}
++	if len(data) < hdrSize {
++		return nil, nil, fmt.Errorf("cs2: media record too short: got %d bytes, need at least %d", len(data), hdrSize)
++	}
+ 	return data[:hdrSize], data[hdrSize:], nil
+ }
+ 
+@@ -427,31 +442,57 @@
+ 	pushBuf  map[uint16][]byte
+ 	pushSize int
+ 
+-	waitData []byte
+-	waitSize int
+-	popBuf   chan []byte
++	waitData       []byte
++	waitSize       int
++	waitHeader     [4]byte
++	waitHeaderSize int
++	popBuf         chan []byte
+ }
+ 
+-func (c *dataChannel) Push(b []byte) error {
+-	c.waitData = append(c.waitData, b...)
++// Xiaomi camera records handled by this product are bounded to 2 MiB.
++const maxRecordSize = 2 * 1024 * 1024
+ 
+-	for len(c.waitData) > 4 {
+-		// Every new data starts with size. There can be several data inside one packet.
++func (c *dataChannel) Push(b []byte) error {
++	for len(b) > 0 {
+ 		if c.waitSize == 0 {
+-			c.waitSize = int(binary.BigEndian.Uint32(c.waitData))
+-			c.waitData = c.waitData[4:]
++			n := copy(c.waitHeader[c.waitHeaderSize:], b)
++			c.waitHeaderSize += n
++			b = b[n:]
++			if c.waitHeaderSize < len(c.waitHeader) {
++				return nil
++			}
++
++			recordSize := binary.BigEndian.Uint32(c.waitHeader[:])
++			c.waitHeaderSize = 0
++			if recordSize == 0 {
++				continue
++			}
++			if recordSize > uint32(maxRecordSize) {
++				c.waitData = nil
++				c.waitSize = 0
++				return fmt.Errorf("cs2: invalid record size %d (maximum %d)", recordSize, maxRecordSize)
++			}
++			c.waitSize = int(recordSize)
++			c.waitData = make([]byte, 0, c.waitSize)
+ 		}
+-		if c.waitSize > len(c.waitData) {
+-			break
++
++		n := c.waitSize - len(c.waitData)
++		if n > len(b) {
++			n = len(b)
++		}
++		c.waitData = append(c.waitData, b[:n]...)
++		b = b[n:]
++		if len(c.waitData) < c.waitSize {
++			return nil
+ 		}
+ 
+ 		select {
+-		case c.popBuf <- c.waitData[:c.waitSize]:
++		case c.popBuf <- c.waitData:
+ 		default:
+ 			return fmt.Errorf("pop buffer is full")
+ 		}
+ 
+-		c.waitData = c.waitData[c.waitSize:]
++		c.waitData = nil
+ 		c.waitSize = 0
+ 	}
+ 	return nil
