@@ -3,8 +3,6 @@
 /toolchains/
 /downloads/
 /build/
-/releases/
-/release-support/
 /.cache/
 /.env
 /.env.*
@@ -16,6 +14,7 @@ __pycache__/
 *.so.*
 *.app
 *.plugin
+!releases/**/*.plugin
 *.log
 *.pem
 *.key
