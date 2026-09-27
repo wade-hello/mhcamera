@@ -107,6 +107,67 @@ static bool xc_decimal_id(const char *text, size_t maximum)
     return true;
 }
 
+static bool xc_did_valid(const char *text, size_t maximum)
+{
+    return text && text[0] != '\0' && strnlen(text, maximum + 1u) <= maximum;
+}
+
+static int xc_hex_digit(unsigned char ch)
+{
+    if (ch >= '0' && ch <= '9') return ch - '0';
+    if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+    if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+    return -1;
+}
+
+static int xc_query_decode(char *output, size_t size,
+                           const char *begin, const char *end)
+{
+    size_t length = 0u;
+
+    if (!output || !size || !begin || !end || end <= begin) return -1;
+    while (begin < end) {
+        unsigned char ch = (unsigned char)*begin++;
+
+        if (ch == '%') {
+            int high, low;
+
+            if (end - begin < 2 ||
+                (high = xc_hex_digit((unsigned char)begin[0])) < 0 ||
+                (low = xc_hex_digit((unsigned char)begin[1])) < 0) return -1;
+            ch = (unsigned char)((high << 4) | low);
+            begin += 2;
+        } else if (ch == '+') ch = ' ';
+        if (!ch || length + 1u >= size) return -1;
+        output[length++] = (char)ch;
+    }
+    output[length] = '\0';
+    return 0;
+}
+
+static int xc_query_encode(char *output, size_t size, const char *value)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    size_t length = 0u;
+
+    if (!output || !size || !value) return -1;
+    for (; *value; ++value) {
+        unsigned char ch = (unsigned char)*value;
+
+        if (xc_identity_char(ch) || ch == '~') {
+            if (length + 1u >= size) return -1;
+            output[length++] = (char)ch;
+        } else {
+            if (length + 3u >= size) return -1;
+            output[length++] = '%';
+            output[length++] = hex[ch >> 4];
+            output[length++] = hex[ch & 15u];
+        }
+    }
+    output[length] = '\0';
+    return 0;
+}
+
 static int xc_copy_range(char *output,
                          size_t output_size,
                          const char *begin,
@@ -154,7 +215,7 @@ static int xc_query_identity(const char *source, const char *key,
         equals = memchr(cursor, '=', (size_t)(end - cursor));
         if (!equals || equals == cursor || equals + 1 == end) goto invalid;
         if (xc_range_equals(cursor, equals, key)) {
-            if (found || xc_copy_range(output, output_size, equals + 1, end) != 0)
+            if (found || xc_query_decode(output, output_size, equals + 1, end) != 0)
                 goto invalid;
             found = true;
         }
@@ -196,6 +257,7 @@ int xc_camera_source_rebuild(const char *core_source,
     char host[INET_ADDRSTRLEN];
     char canonical_host[INET_ADDRSTRLEN];
     char did[65] = {0};
+    char encoded_did[sizeof(did) * 3u];
     char model[129] = {0};
     const char *authority;
     const char *at;
@@ -208,7 +270,7 @@ int xc_camera_source_rebuild(const char *core_source,
     if (!core_source || !output || output_size == 0u ||
         !xc_decimal_id(expected_account_id, 64u) ||
         !xc_region_valid(expected_region) ||
-        !xc_decimal_id(expected_camera_id, 64u) ||
+        !xc_did_valid(expected_camera_id, 64u) ||
         !xc_identity_valid(expected_model, 128u) ||
         (channel != 1u && channel != 2u) ||
         strncmp(core_source, XC_SOURCE_PREFIX, strlen(XC_SOURCE_PREFIX)) != 0 ||
@@ -245,7 +307,7 @@ int xc_camera_source_rebuild(const char *core_source,
         if (!equals || equals == cursor || equals + 1 == end) goto invalid;
         if (xc_range_equals(cursor, equals, "did")) {
             if (did[0] != '\0' ||
-                xc_copy_range(did, sizeof(did), equals + 1, end) != 0)
+                xc_query_decode(did, sizeof(did), equals + 1, end) != 0)
                 goto invalid;
         } else if (xc_range_equals(cursor, equals, "model")) {
             if (model[0] != '\0' ||
@@ -254,15 +316,19 @@ int xc_camera_source_rebuild(const char *core_source,
         } else goto invalid;
         cursor = *end ? end + 1 : end;
     }
-    if (!xc_decimal_id(did, 64u) || !xc_identity_valid(model, 128u) ||
+    if (!xc_did_valid(did, 64u) || !xc_identity_valid(model, 128u) ||
         strcmp(did, expected_camera_id) != 0 ||
-        strcmp(model, expected_model) != 0)
+        strcmp(model, expected_model) != 0 ||
+        xc_query_encode(encoded_did, sizeof(encoded_did), did) != 0)
         goto invalid;
+    /* Leave the P2P transport unset so go2rtc advertises both UDP and TCP
+     * P2P-ready messages and follows whichever one the camera answers.
+     * Forcing transport=tcp breaks cameras that only answer UDP-ready. */
     written = snprintf(output, output_size,
                        channel == 1u ?
-                       "xiaomi://%s:%s@%s?did=%s&model=%s&subtype=1&audio=%u&transport=tcp" :
-                       "xiaomi://%s:%s@%s?did=%s&model=%s&channel=2&subtype=1&audio=%u&transport=tcp",
-                       account, region, canonical_host, did, model, audio_enabled ? 1u : 0u);
+                       "xiaomi://%s:%s@%s?did=%s&model=%s&subtype=1&audio=%u" :
+                       "xiaomi://%s:%s@%s?did=%s&model=%s&channel=2&subtype=1&audio=%u",
+                       account, region, canonical_host, encoded_did, model, audio_enabled ? 1u : 0u);
     if (written < 0 || (size_t)written >= output_size) {
         output[0] = '\0';
         errno = ENOSPC;
@@ -289,7 +355,7 @@ int xc_camera_source_identify(const char *core_source,
     if (!camera_id || !model ||
         xc_query_identity(core_source, "did", camera_id, camera_id_size) != 0 ||
         xc_query_identity(core_source, "model", model, model_size) != 0 ||
-        !xc_decimal_id(camera_id, 64u) || !xc_identity_valid(model, 128u) ||
+        !xc_did_valid(camera_id, 64u) || !xc_identity_valid(model, 128u) ||
         xc_camera_source_rebuild(core_source, expected_account_id,
                                  expected_region, camera_id, model,
                                  1u, false,
@@ -299,4 +365,16 @@ int xc_camera_source_identify(const char *core_source,
         return -1;
     }
     return 0;
+}
+
+bool xc_camera_source_audio_enabled(const char *source)
+{
+    char value[2];
+
+    if (!source ||
+        strncmp(source, XC_SOURCE_PREFIX, strlen(XC_SOURCE_PREFIX)) != 0)
+        return false;
+    if (xc_query_identity(source, "audio", value, sizeof(value)) != 0)
+        return false;
+    return strcmp(value, "1") == 0;
 }

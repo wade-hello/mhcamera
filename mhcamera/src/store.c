@@ -400,6 +400,11 @@ static bool xc_decimal_id(const char *value, size_t maximum, bool allow_empty)
     return true;
 }
 
+static bool xc_camera_id_valid(const char *value)
+{
+    return value && value[0] != '\0' && strnlen(value, 65u) <= 64u;
+}
+
 int xc_store_selection_read(const char *path,
                             struct xc_saved_selection *selection)
 {
@@ -477,7 +482,7 @@ int xc_store_selection_read(const char *path,
                              channel->valueint != 2)) ||
             (cJSON_IsTrue(enabled) && !cJSON_IsTrue(selected)) ||
             (cJSON_IsTrue(selected) &&
-             (!xc_decimal_id(id->valuestring, 64u, false) ||
+             (!xc_camera_id_valid(id->valuestring) ||
               !model->valuestring[0])) ||
             (!cJSON_IsTrue(selected) && has_channel) ||
             (!cJSON_IsTrue(selected) &&
@@ -526,7 +531,7 @@ int xc_store_selection_write(const char *path,
             xc_region_parse(selection->region, &parsed_region) != 0 ||
             (selection->enabled && !selection->exists) ||
             (selection->exists &&
-             (!xc_decimal_id(selection->id, 64u, false) ||
+             (!xc_camera_id_valid(selection->id) ||
               !selection->model[0])) ||
             (!selection->exists &&
              (selection->id[0] || selection->name[0] ||

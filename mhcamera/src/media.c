@@ -287,6 +287,15 @@ static enum xc_media_delivery_result xc_deliver(
         errno = open_errno;
         return XC_MEDIA_DELIVERY_DROPPED;
     }
+    /* The ingress-ready handshake can consume up to four seconds. Recheck
+     * against the original timeline before sending the frame retained by open. */
+    now = xc_monotonic_us();
+    if (now == 0u ||
+        !xc_media_timestamp_fresh(&session->freshness, pts_us, now,
+                                  XC_MEDIA_MAX_LAG_US)) {
+        errno = ESTALE;
+        return XC_MEDIA_DELIVERY_FATAL;
+    }
     memset(&frame, 0, sizeof(frame));
     frame.format = format;
     frame.width = width;

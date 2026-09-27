@@ -1,6 +1,6 @@
 # Third-party materials
 
-The project's own code is covered by the repository's [MIT license](../../LICENSE).
+The current project's own code is distributed under [GPL-3.0-only](../../LICENSE).
 Third-party components and the host SDK retain their own terms. Usage and build
 instructions are in the root [README](../../README.md) and [BUILD](../../BUILD.md).
 
@@ -11,7 +11,7 @@ instructions are in the root [README](../../README.md) and [BUILD](../../BUILD.m
 - `go2rtc/LICENSE`: the upstream go2rtc MIT license. The build collects the actual selected Go module graph and required dependency license files into the runtime legal directory.
 
 Keep the applicable copyright notices, licenses and generated dependency records
-when distributing the plugin. The project MIT license does not replace them.
+when distributing the plugin. The project GPL license does not replace them.
 
 ## Release companions
 
@@ -38,7 +38,6 @@ An ordinary device account can inspect the provided development documentation
 and export the compilation interfaces described in the build guide.
 
 The exported host SDK stays in the local workspace's ignored `sdk/` directory;
-it is not vendored as project source or included in the plugin package. Its
-redistribution terms have not been established by this project and are not
-replaced by the project's MIT license. Consult the SDK's applicable terms before
-redistributing it.
+it is not vendored as project source or included in the plugin package. The
+device provides `libainice.so` at runtime; it is not covered by the project's
+GPL license. Redistribution of the SDK itself is governed by its own terms.

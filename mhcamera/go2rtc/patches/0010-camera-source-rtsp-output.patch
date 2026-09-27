@@ -985,7 +985,15 @@ index 5e018fe..47a62c6 100644
  	query := url.Query()
  
  	clientPublic, clientPrivate, err := crypto.GenerateKey()
-@@ -256,7 +274,7 @@ func getLegacyURL(url *url.URL) (string, error) {
+@@ -253,10 +271,14 @@ func getLegacyURL(url *url.URL) (string, error) {
+ 	}
+ 
+-	params := fmt.Sprintf(`{"did":"%s","toSignAppData":"%x"}`, query.Get("did"), clientPublic)
++	didJSON, err := json.Marshal(query.Get("did"))
++	if err != nil {
++		return "", err
++	}
++	params := fmt.Sprintf(`{"did":%s,"toSignAppData":"%x"}`, didJSON, clientPublic)
  
  	userID := url.User.Username()
  	region, _ := url.User.Password()
@@ -1003,8 +1011,17 @@ index 5e018fe..47a62c6 100644
  	clientPublic, clientPrivate, err := crypto.GenerateKey()
  	if err != nil {
  		return "", err
-@@ -298,10 +316,10 @@ func getMissURL(url *url.URL) (string, error) {
- 		clientPublic, query.Get("did"),
+@@ -296,13 +314,17 @@ func getMissURL(url *url.URL) (string, error) {
+ 	query := url.Query()
++	didJSON, err := json.Marshal(query.Get("did"))
++	if err != nil {
++		return "", err
++	}
+ 	params := fmt.Sprintf(
+-		`{"app_pubkey":"%x","did":"%s","support_vendors":"TUTK_CS2_MTP"}`,
+-		clientPublic, query.Get("did"),
++		`{"app_pubkey":"%x","did":%s,"support_vendors":"TUTK_CS2_MTP"}`,
++		clientPublic, didJSON,
  	)
  
 -	res, err := cloudUserRequest(url.User, "/v2/device/miss_get_vendor", params)
@@ -1016,16 +1033,24 @@ index 5e018fe..47a62c6 100644
  		}
  		return "", err
  	}
-@@ -348,10 +366,10 @@ func getVendorName(i byte) string {
+@@ -348,10 +366,18 @@ func getVendorName(i byte) string {
  	return fmt.Sprintf("%d", i)
  }
  
++func wakeUpCameraPath(did string) string {
++	escaped := url.PathEscape(did)
++	if escaped == "." || escaped == ".." {
++		escaped = strings.ReplaceAll(escaped, ".", "%2E")
++	}
++	return "/home/rpc/" + escaped
++}
++
 -func wakeUpCamera(url *url.URL) error {
 +func wakeUpCameraContext(ctx context.Context, url *url.URL) error {
  	const params = `{"id":1,"method":"wakeup","params":{"video":"1"}}`
  	did := url.Query().Get("did")
 -	_, err := cloudUserRequest(url.User, "/home/rpc/"+did, params)
-+	_, err := cloudUserRequestContext(ctx, url.User, "/home/rpc/"+did, params)
++	_, err := cloudUserRequestContext(ctx, url.User, wakeUpCameraPath(did), params)
  	return err
  }
  
@@ -2338,3 +2363,469 @@ index d0290f2..d6ef669 100644
  func IsLegacy(model string) bool {
  	return legacy.Supported(model)
  }
+diff --git a/internal/xiaomi/xiaomi.go b/internal/xiaomi/xiaomi.go
+--- a/internal/xiaomi/xiaomi.go
++++ b/internal/xiaomi/xiaomi.go
+@@ -393,8 +393,8 @@
+ func apiXiaomi(w http.ResponseWriter, r *http.Request) {
+-	switch r.Method {
+-	case "GET":
+-		apiDeviceList(w, r)
+-	case "POST":
+-		apiAuth(w, r)
++	if r.Method != http.MethodGet {
++		w.Header().Set("Allow", http.MethodGet)
++		http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
++		return
+ 	}
++	apiDeviceList(w, r)
+ }
+@@ -1026,56 +1026,0 @@
+-var auth *xiaomi.Cloud
+-
+-func apiAuth(w http.ResponseWriter, r *http.Request) {
+-	if err := r.ParseForm(); err != nil {
+-		http.Error(w, err.Error(), http.StatusBadRequest)
+-		return
+-	}
+-
+-	username := r.Form.Get("username")
+-	password := r.Form.Get("password")
+-	captcha := r.Form.Get("captcha")
+-	verify := r.Form.Get("verify")
+-
+-	var err error
+-
+-	switch {
+-	case username != "" || password != "":
+-		auth = xiaomi.NewCloud(AppXiaomiHome)
+-		err = auth.Login(username, password)
+-	case captcha != "":
+-		err = auth.LoginWithCaptcha(captcha)
+-	case verify != "":
+-		err = auth.LoginWithVerify(verify)
+-	default:
+-		http.Error(w, "wrong request", http.StatusBadRequest)
+-		return
+-	}
+-
+-	if err == nil {
+-		userID, token := auth.UserToken()
+-		auth = nil
+-
+-		cloudsMu.Lock()
+-		if tokens == nil {
+-			tokens = map[string]string{userID: token}
+-		} else {
+-			tokens[userID] = token
+-		}
+-		cloudsMu.Unlock()
+-
+-		err = app.PatchConfig([]string{"xiaomi", userID}, token)
+-	}
+-
+-	if err != nil {
+-		var login *xiaomi.LoginError
+-		if errors.As(err, &login) {
+-			w.Header().Set("Content-Type", api.MimeJSON)
+-			w.WriteHeader(http.StatusUnauthorized)
+-			_ = json.NewEncoder(w).Encode(err)
+-			return
+-		}
+-
+-		http.Error(w, err.Error(), http.StatusInternalServerError)
+-	}
+-}
+-
+diff --git a/pkg/xiaomi/cloud.go b/pkg/xiaomi/cloud.go
+--- a/pkg/xiaomi/cloud.go
++++ b/pkg/xiaomi/cloud.go
+@@ -3,7 +3,6 @@
+ import (
+ 	"bytes"
+ 	"context"
+-	"crypto/md5"
+ 	"crypto/rand"
+ 	"crypto/rc4"
+ 	"crypto/sha1"
+@@ -15,11 +14,8 @@
+ 	"io"
+ 	"net/http"
+ 	"net/url"
+-	"strconv"
+ 	"strings"
+ 	"time"
+-
+-	"github.com/AlexxIT/go2rtc/pkg/core"
+ )
+ 
+ type Cloud struct {
+@@ -31,8 +27,6 @@
+ 
+ 	userID    string
+ 	passToken string
+-
+-	auth map[string]string
+ }
+ 
+ type CloudErrorKind uint8
+@@ -81,281 +75,6 @@
+ 	}
+ }
+ 
+-func (c *Cloud) Login(username, password string) error {
+-	res, err := c.client.Get("https://account.xiaomi.com/pass/serviceLogin?_json=true&sid=" + c.sid)
+-	if err != nil {
+-		return err
+-	}
+-
+-	var v1 struct {
+-		Qs       string `json:"qs"`
+-		Sign     string `json:"_sign"`
+-		Sid      string `json:"sid"`
+-		Callback string `json:"callback"`
+-	}
+-	if _, err = readLoginResponse(res.Body, &v1); err != nil {
+-		return err
+-	}
+-
+-	hash := fmt.Sprintf("%X", md5.Sum([]byte(password)))
+-
+-	form := url.Values{
+-		"_json":    {"true"},
+-		"hash":     {hash},
+-		"sid":      {v1.Sid},
+-		"callback": {v1.Callback},
+-		"_sign":    {v1.Sign},
+-		"qs":       {v1.Qs},
+-		"user":     {username},
+-	}
+-	cookies := "deviceId=" + core.RandString(16, 62)
+-
+-	// login after captcha
+-	if c.auth != nil && c.auth["captcha_code"] != "" {
+-		form.Set("captCode", c.auth["captcha_code"])
+-		cookies += "; ick=" + c.auth["ick"]
+-	}
+-
+-	req := Request{
+-		Method:     "POST",
+-		URL:        "https://account.xiaomi.com/pass/serviceLoginAuth2",
+-		Body:       form,
+-		RawCookies: cookies,
+-	}.Encode()
+-
+-	res, err = c.client.Do(req)
+-	if err != nil {
+-		return err
+-	}
+-
+-	var v2 struct {
+-		Ssecurity []byte `json:"ssecurity"`
+-		PassToken string `json:"passToken"`
+-		Location  string `json:"location"`
+-
+-		CaptchaURL      string `json:"captchaURL"`
+-		NotificationURL string `json:"notificationUrl"`
+-	}
+-	body, err := readLoginResponse(res.Body, &v2)
+-	if err != nil {
+-		return err
+-	}
+-
+-	// save auth for two-step verification
+-	c.auth = map[string]string{
+-		"username": username,
+-		"password": password,
+-	}
+-
+-	if v2.CaptchaURL != "" {
+-		return c.getCaptcha(v2.CaptchaURL)
+-	}
+-
+-	if v2.NotificationURL != "" {
+-		return c.authStart(v2.NotificationURL)
+-	}
+-
+-	if v2.Location == "" {
+-		return fmt.Errorf("xiaomi: %s", body)
+-	}
+-
+-	c.auth = nil
+-	c.ssecurity = v2.Ssecurity
+-	c.passToken = v2.PassToken
+-
+-	return c.finishAuth(v2.Location)
+-}
+-
+-func (c *Cloud) LoginWithCaptcha(captcha string) error {
+-	if c.auth == nil || c.auth["ick"] == "" {
+-		panic("wrong login step")
+-	}
+-
+-	c.auth["captcha_code"] = captcha
+-
+-	// check if captcha after verify
+-	if c.auth["flag"] != "" {
+-		return c.sendTicket()
+-	}
+-
+-	return c.Login(c.auth["username"], c.auth["password"])
+-}
+-
+-func (c *Cloud) LoginWithVerify(ticket string) error {
+-	if c.auth == nil || c.auth["flag"] == "" {
+-		panic("wrong login step")
+-	}
+-
+-	req := Request{
+-		Method:     "POST",
+-		URL:        "https://account.xiaomi.com/identity/auth/verify" + c.verifyName(),
+-		RawParams:  "_flag" + c.auth["flag"] + "&ticket=" + ticket + "&trust=false&_json=true",
+-		RawCookies: "identity_session=" + c.auth["identity_session"],
+-	}.Encode()
+-
+-	res, err := c.client.Do(req)
+-	if err != nil {
+-		return err
+-	}
+-
+-	var v1 struct {
+-		Location string `json:"location"`
+-	}
+-	body, err := readLoginResponse(res.Body, &v1)
+-	if err != nil {
+-		return err
+-	}
+-	if v1.Location == "" {
+-		return fmt.Errorf("xiaomi: %s", body)
+-	}
+-
+-	return c.finishAuth(v1.Location)
+-}
+-
+-func (c *Cloud) getCaptcha(captchaURL string) error {
+-	res, err := c.client.Get("https://account.xiaomi.com" + captchaURL)
+-	if err != nil {
+-		return err
+-	}
+-	defer res.Body.Close()
+-
+-	body, err := io.ReadAll(res.Body)
+-	if err != nil {
+-		return err
+-	}
+-
+-	c.auth["ick"] = findCookie(res, "ick")
+-
+-	return &LoginError{
+-		Captcha: body,
+-	}
+-}
+-
+-func (c *Cloud) authStart(notificationURL string) error {
+-	rawURL := strings.Replace(notificationURL, "/fe/service/identity/authStart", "/identity/list", 1)
+-	res, err := c.client.Get(rawURL)
+-	if err != nil {
+-		return err
+-	}
+-
+-	var v1 struct {
+-		Code int `json:"code"`
+-		Flag int `json:"flag"`
+-	}
+-	if _, err = readLoginResponse(res.Body, &v1); err != nil {
+-		return err
+-	}
+-
+-	c.auth["flag"] = strconv.Itoa(v1.Flag)
+-	c.auth["identity_session"] = findCookie(res, "identity_session")
+-
+-	return c.sendTicket()
+-}
+-
+-func findCookie(res *http.Response, name string) string {
+-	for _, cookie := range res.Cookies() {
+-		if cookie.Name == name {
+-			return cookie.Value
+-		}
+-	}
+-	return ""
+-}
+-
+-func (c *Cloud) verifyName() string {
+-	switch c.auth["flag"] {
+-	case "4":
+-		return "Phone"
+-	case "8":
+-		return "Email"
+-	}
+-	return ""
+-}
+-
+-func (c *Cloud) sendTicket() error {
+-	name := c.verifyName()
+-	cookies := "identity_session=" + c.auth["identity_session"]
+-
+-	req := Request{
+-		URL:        "https://account.xiaomi.com/identity/auth/verify" + name,
+-		RawParams:  "_flag=" + c.auth["flag"] + "&_json=true",
+-		RawCookies: cookies,
+-	}.Encode()
+-
+-	res, err := c.client.Do(req)
+-	if err != nil {
+-		return err
+-	}
+-
+-	var v1 struct {
+-		Code        int    `json:"code"`
+-		MaskedPhone string `json:"maskedPhone"`
+-		MaskedEmail string `json:"maskedEmail"`
+-	}
+-	if _, err = readLoginResponse(res.Body, &v1); err != nil {
+-		return err
+-	}
+-
+-	// verify after captcha
+-	captCode := c.auth["captcha_code"]
+-	if captCode != "" {
+-		cookies += "; ick=" + c.auth["ick"]
+-	}
+-
+-	form := url.Values{
+-		"_json": {"true"},
+-		"icode": {captCode},
+-		"retry": {"0"},
+-	}
+-
+-	req = Request{
+-		Method:     "POST",
+-		URL:        "https://account.xiaomi.com/identity/auth/send" + name + "Ticket",
+-		Body:       form,
+-		RawCookies: cookies,
+-	}.Encode()
+-
+-	res, err = c.client.Do(req)
+-	if err != nil {
+-		return err
+-	}
+-
+-	var v2 struct {
+-		Code       int    `json:"code"`
+-		CaptchaURL string `json:"captchaURL"`
+-	}
+-	body, err := readLoginResponse(res.Body, &v2)
+-	if err != nil {
+-		return err
+-	}
+-
+-	if v2.CaptchaURL != "" {
+-		return c.getCaptcha(v2.CaptchaURL)
+-	}
+-
+-	if v2.Code != 0 {
+-		return fmt.Errorf("xiaomi: %s", body)
+-	}
+-
+-	return &LoginError{
+-		VerifyPhone: v1.MaskedPhone,
+-		VerifyEmail: v1.MaskedEmail,
+-	}
+-}
+-
+-type LoginError struct {
+-	Captcha     []byte `json:"captcha,omitempty"`
+-	VerifyPhone string `json:"verify_phone,omitempty"`
+-	VerifyEmail string `json:"verify_email,omitempty"`
+-}
+-
+-func (l *LoginError) Error() string {
+-	return ""
+-}
+-
+-func (c *Cloud) finishAuth(location string) error {
+-	return c.finishAuthResponse(location, CloudErrorHTTP, false)
+-}
+-
+ func (c *Cloud) finishAuthResponse(location string, rejectionKind CloudErrorKind, requireSession bool) error {
+ 	return c.finishAuthResponseContext(context.Background(), location, rejectionKind, requireSession)
+ }
+@@ -381,12 +100,7 @@
+ 		return &CloudError{Kind: kind, RequestStageCode: RequestStageTokenFinish, HTTPStatus: res.StatusCode}
+ 	}
+ 
+-	// LoginWithVerify
+-	//   - userId, cUserId, serviceToken from cookies
+-	//   - passToken from redirect cookies
+-	//   - ssecurity from extra header
+-	// LoginWithToken
+-	//   - userId, cUserId, serviceToken from cookies
++	// Token login obtains userId, cUserId and serviceToken from cookies.
+ 	var cUserId, serviceToken string
+ 
+ 	for res != nil {
+@@ -592,22 +306,6 @@
+ 	return nil
+ }
+ 
+-func readLoginResponse(rc io.ReadCloser, v any) ([]byte, error) {
+-	defer rc.Close()
+-
+-	body, err := io.ReadAll(rc)
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	body, ok := bytes.CutPrefix(body, []byte("&&&START&&&"))
+-	if !ok {
+-		return nil, fmt.Errorf("xiaomi: %s", body)
+-	}
+-
+-	return body, json.Unmarshal(body, &v)
+-}
+-
+ func genNonce() []byte {
+ 	ts := time.Now().Unix() / 60
+ 
+@@ -652,40 +350,3 @@
+ 
+ 	return base64.StdEncoding.EncodeToString(signature)
+ }
+-
+-type Request struct {
+-	Method     string
+-	URL        string
+-	RawParams  string
+-	Body       url.Values
+-	Headers    url.Values
+-	RawCookies string
+-}
+-
+-func (r Request) Encode() *http.Request {
+-	if r.RawParams != "" {
+-		r.URL += "?" + r.RawParams
+-	}
+-
+-	var body io.Reader
+-	if r.Body != nil {
+-		body = strings.NewReader(r.Body.Encode())
+-	}
+-
+-	req, err := http.NewRequest(r.Method, r.URL, body)
+-	if err != nil {
+-		return nil
+-	}
+-
+-	if r.Headers != nil {
+-		req.Header = http.Header(r.Headers)
+-	}
+-	if r.Body != nil {
+-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+-	}
+-	if r.RawCookies != "" {
+-		req.Header.Set("Cookie", r.RawCookies)
+-	}
+-
+-	return req
+-}

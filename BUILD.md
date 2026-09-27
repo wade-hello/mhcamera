@@ -8,7 +8,7 @@
 mhcamera-dev/
   README.md                 项目介绍与非官方声明
   BUILD.md                  开发入口
-  LICENSE                   本项目 MIT 许可
+  LICENSE                   当前源码的 GPL-3.0-only 许可
   scripts/                  环境、SDK 导出、构建与打包
   mhcamera/                 plugin.json、src、www、legal、go2rtc
   sdk/ainice/               板端 SDK 头文件和 libainice.so
@@ -17,10 +17,10 @@ mhcamera-dev/
   downloads/                第三方源码和工具链下载缓存
   build/                    编译缓存及 runtime
   releases/                 插件包及其 SHA-256 校验文件
-  release-support/          分版本保存第三方源码及发布元数据
+  release-support/          分版本保存项目与第三方源码及发布元数据
 ```
 
-`sdk/` 中除说明文档外的内容，以及 `toolchains/`、`downloads/`、`build/`、`releases/`、`release-support/` 均由 `.gitignore` 排除。不要将包含本地开发依赖的整个工作区直接作为源码压缩包上传；发布包及其配套材料单独作为发布附件提供。
+`sdk/` 中除说明文档外的内容，以及 `toolchains/`、`downloads/`、`build/` 均由 `.gitignore` 排除。发布材料按版本单独管理。不要将包含本地开发依赖的整个工作区直接作为源码压缩包上传；发布包及其配套材料单独作为发布附件提供。
 
 ## 准备工具链
 
@@ -61,7 +61,7 @@ bash scripts/export_device_sdk.sh
 
 脚本默认普通用户名为 `ainice`、端口为 `22`，可通过 `BOARD_USER` 和 `BOARD_PORT` 显式指定。不使用 root 调试端口，不修改板端文件、服务或配置。当前导出方法对应 cJSON 1.7.19；固件改变此依赖版本时，需要同步调整导出文件名、上游版本和摘要，不能混用。
 
-这些文件只是本地交叉编译依赖。能从设备读取不代表已经确认可以公开再分发，SDK 不纳入本项目 MIT 授权，也不进入插件安装包。
+这些文件只是本地交叉编译依赖。设备提供的宿主 SDK 不纳入本项目 GPL-3.0-only 授权，也不进入插件安装包；单独再分发 SDK 应遵守其自身条款。
 
 ## 构建与打包
 
@@ -77,13 +77,20 @@ python3 scripts/package_plugin.py
 
 依赖固定为 FFmpeg 4.4.4、Go 1.24.0，以及 go2rtc 1.9.14 的提交 `b5948cfb25404cc5cb37b166ecaa2dca20b11d4b`。go2rtc 生产补丁及来源锁定信息在 `mhcamera/go2rtc/`；公开构建不运行测试。
 
-默认 FFmpeg 安装目录为 `build/ffmpeg/install/usr/local/`，插件运行文件放在 `build/runtime/`。`releases/` 保存插件文件及其校验文件，其余发布材料按插件版本保存在 `release-support/`：
+默认 FFmpeg 安装目录为 `build/ffmpeg/install/usr/local/`，插件运行文件放在 `build/runtime/`。当前本地发布材料为 v1.0.9；`releases/` 保存插件文件及其校验文件，其余发布材料保存在 `release-support/mhcamera-1.0.9/`。这些文件尚未上传 GitHub Release：
 
 ```text
 releases/
-  mhcamera-1.0.5.plugin
-  mhcamera-1.0.5.plugin.sha256
-release-support/mhcamera-1.0.5/
+  mhcamera-1.0.9.plugin
+  mhcamera-1.0.9.plugin.sha256
+release-support/mhcamera-1.0.9/
+  README.md                 附件内容与离线依赖恢复说明
+  sources/mhcamera-1.0.9-source.tar.gz
+  sources/mhcamera-1.0.9-source.tar.gz.sha256
+  sources/go2rtc-b5948cfb25404cc5cb37b166ecaa2dca20b11d4b.tar.gz
+  sources/go2rtc-b5948cfb25404cc5cb37b166ecaa2dca20b11d4b.tar.gz.sha256
+  sources/go-modules-1.0.9.tar.gz
+  sources/go-modules-1.0.9.tar.gz.sha256
   sources/ffmpeg-4.4.4.tar.xz
   sources/ffmpeg-4.4.4.tar.xz.sha256
   latest.json               仅在显式提供发布 URL 时生成
@@ -91,6 +98,8 @@ release-support/mhcamera-1.0.5/
 
 构建位置可通过 `FFMPEG_ROOT`、`RUNTIME_ROOT` 指定。打包参数 `--output-dir` 指定插件及其校验文件目录，`--support-dir` 指定附件根目录；打包脚本会在附件根目录下建立对应版本的子目录。
 
-在 `releases/` 目录运行 `sha256sum -c mhcamera-1.0.5.plugin.sha256` 可校验插件；FFmpeg 源码校验从 `sources/` 目录运行。校验文件记录同目录的文件名。
+在 `releases/` 目录运行 `sha256sum -c mhcamera-1.0.9.plugin.sha256` 可校验插件；源码附件校验从 `release-support/mhcamera-1.0.9/sources/` 目录运行。校验文件记录同目录的文件名。
 
-发布插件时仍需提供对应的源码和校验材料，可以作为同一 GitHub Release 的附件，或通过发布说明链接到对应下载位置。`release-support/` 是分发配套材料，不是可以随意丢弃的构建缓存。保留包内完整许可材料；用户只需通过设备插件管理器安装 `.plugin`，不需要安装源码包，也不通过 SSH 直接改写设备的插件目录。
+项目源码归档只包含仓库跟踪的源码、许可和构建脚本，不含本地 SDK、工具链或构建缓存。`go-modules-1.0.9.tar.gz` 保存此次 go2rtc 构建使用的 Go 模块缓存；恢复方法见同版本的 `release-support/mhcamera-1.0.9/README.md`。
+
+发布插件时仍需提供对应的本项目源码、构建脚本、FFmpeg 源码及校验材料，可以作为同一 GitHub Release 的附件，或通过发布说明链接到对应下载位置。`release-support/` 是分发配套材料，不是可以随意丢弃的构建缓存。保留包内完整许可材料；用户只需通过设备插件管理器安装 `.plugin`，不需要安装源码包，也不通过 SSH 直接改写设备的插件目录。

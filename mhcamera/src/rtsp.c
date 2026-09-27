@@ -25,6 +25,7 @@ struct xc_rtsp {
     bool enabled;
     bool audio_enabled;
     bool source_available;
+    bool refresh_paused;
     enum xc_rtsp_listener_state listener;
     bool query_failed;
     struct xc_rtsp_state observed;
@@ -161,7 +162,7 @@ static int control_locked(struct xc_rtsp *rtsp, const bool *enabled)
     rtsp->query_failed = false;
     /* A successful read resolves transport uncertainty, but says nothing
      * about a previous save/durability/rollback failure. */
-    if (!enabled && rtsp->error && rtsp->error == XC_RTSP_ERROR_CONTROL &&
+    if (!enabled && !rtsp->refresh_paused && rtsp->error == XC_RTSP_ERROR_CONTROL &&
         (state.listener == XC_RTSP_LISTENER_RUNNING) == (rtsp->enabled && rtsp->source_available))
         rtsp->error = XC_RTSP_ERROR_NONE;
     return 0;
@@ -179,9 +180,9 @@ int xc_rtsp_source(struct xc_rtsp *rtsp, bool available)
         return 0;
     }
     rtsp->source_available = available;
-    target = available && rtsp->enabled;
+    target = available && rtsp->enabled && !rtsp->refresh_paused;
     result = control_locked(rtsp, &target);
-    if (result == 0 && (!rtsp->error ||
+    if (result == 0 && !rtsp->refresh_paused && (!rtsp->error ||
         (rtsp->error != XC_RTSP_ERROR_PERSIST &&
          rtsp->error != XC_RTSP_ERROR_NOT_DURABLE))) rtsp->error = XC_RTSP_ERROR_NONE;
     pthread_mutex_unlock(&rtsp->lock);
@@ -322,6 +323,10 @@ static cJSON *refresh_password_locked(struct xc_rtsp *rtsp)
         result = route_error(AINICE_PROTOCOL_ERROR_INTERNAL_ERROR, "rtsp_random_failed");
         goto done;
     }
+    /* Source reconciliation must not restore the old identity after a failed
+     * rotation. Only a committed replacement or explicit enable/disable clears
+     * this pause; unrelated audio/source changes are not user consent. */
+    rtsp->refresh_paused = true;
     if (control_locked(rtsp, &disabled) != 0) {
         result = route_error(AINICE_PROTOCOL_ERROR_INTERNAL_ERROR, "rtsp_control_failed");
         goto done;
@@ -335,6 +340,7 @@ static cJSON *refresh_password_locked(struct xc_rtsp *rtsp)
         goto done;
     }
     memcpy(rtsp->password, candidate, sizeof(rtsp->password));
+    rtsp->refresh_paused = false;
     applied = target ? control_locked(rtsp, &target) : 0;
     if (saved != XC_STORE_COMMITTED_DURABLE) {
         rtsp->error = XC_RTSP_ERROR_NOT_DURABLE;
@@ -402,8 +408,8 @@ cJSON *xc_rtsp_route(struct xc_rtsp *rtsp, const struct xc_route_request *reques
         result = status_locked(rtsp);
         goto done;
     }
-    previous = rtsp->enabled && rtsp->source_available;
-    target = desired && rtsp->source_available;
+    previous = rtsp->enabled && rtsp->source_available && !rtsp->refresh_paused;
+    target = desired && rtsp->source_available && (!rtsp->refresh_paused || enabled != NULL);
     if (rtsp->source_available && control_locked(rtsp, &target) != 0) {
         /* A lost response may follow a successful sidecar mutation. Restore
          * the committed intent; never assume a failed RPC changed nothing. */
@@ -421,12 +427,13 @@ cJSON *xc_rtsp_route(struct xc_rtsp *rtsp, const struct xc_route_request *reques
     }
     rtsp->enabled = desired;
     rtsp->audio_enabled = desired_audio;
+    if (enabled) rtsp->refresh_paused = false;
     if (saved != XC_STORE_COMMITTED_DURABLE) {
         rtsp->error = XC_RTSP_ERROR_NOT_DURABLE;
         result = route_error(AINICE_PROTOCOL_ERROR_INTERNAL_ERROR, xc_rtsp_error_text(rtsp->error));
         goto done;
     }
-    rtsp->error = XC_RTSP_ERROR_NONE;
+    if (!rtsp->refresh_paused) rtsp->error = XC_RTSP_ERROR_NONE;
     result = status_locked(rtsp);
 done:
     pthread_mutex_unlock(&rtsp->lock);

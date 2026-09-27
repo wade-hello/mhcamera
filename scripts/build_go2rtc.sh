@@ -220,7 +220,7 @@ cat >"$stage_tmp/legal/go2rtc/SOURCE-AND-BUILD.md" <<EOF
 - Xiaomi phone patch purpose: private Passport SMS bootstrap with native rotated-token login handoff
 - Xiaomi device pagination patch: $GO2RTC_XIAOMI_DEVICE_PAGINATION_PATCH
 - Xiaomi device pagination patch SHA-256: $xiaomi_device_pagination_patch_sha
-- Xiaomi device pagination patch purpose: complete pagination with validated cursors, atomic snapshots, and duplicate conflict detection
+- Xiaomi device pagination patch purpose: complete pagination with validated cursors, atomic snapshots, and deterministic DID deduplication preferring usable IPv4
 - Xiaomi home/room patch: $GO2RTC_XIAOMI_HOME_ROOM_PATCH
 - Xiaomi home/room patch SHA-256: $xiaomi_home_room_patch_sha
 - Xiaomi home/room patch purpose: strict six-region device catalogs with optional atomic home and room enrichment
@@ -297,7 +297,7 @@ cat >"$stage_tmp/legal/go2rtc/BUILD-PROVENANCE.json" <<EOF
     {
       "file": "$GO2RTC_XIAOMI_DEVICE_PAGINATION_PATCH",
       "sha256": "$xiaomi_device_pagination_patch_sha",
-      "purpose": "complete pagination with validated cursors, atomic snapshots, and duplicate conflict detection"
+      "purpose": "complete pagination with validated cursors, atomic snapshots, and deterministic DID deduplication preferring usable IPv4"
     },
     {
       "file": "$GO2RTC_XIAOMI_HOME_ROOM_PATCH",

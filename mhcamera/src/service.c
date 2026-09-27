@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "ainice/protocol_error_codes.h"
 
@@ -60,6 +61,7 @@ struct xc_work {
     char calling_code[XC_CALLING_CODE_MAX + 1u];
     char national_number[XC_NATIONAL_NUMBER_MAX + 1u];
     char code[XC_CODE_MAX + 1u];
+    bool cancelled_before_start;
     char account_id[XC_ACCOUNT_ID_MAX + 1u];
     char camera_id[XC_CAMERA_ID_MAX + 1u];
     char source[512];
@@ -69,7 +71,6 @@ struct xc_work {
     char model[128];
     enum xc_region region;
     unsigned int channel;
-    bool verify_restored_selection;
     uint64_t recovery_generation;
     uint64_t input_generation;
     unsigned int incomplete_retries;
@@ -118,8 +119,11 @@ struct xc_service {
     char sms_target[96];
     unsigned int sms_code_length;
     uint64_t rate_deadline_monotonic_ms;
+    uint64_t restored_rate_deadline_wall_ms;
     struct xc_xiaomi_error auth_error;
     bool has_auth_error;
+    bool auth_cancel_requested;
+    bool auth_cancel_clear;
     char operation_cache[XC_OPERATION_CACHE_MAX][XC_OPERATION_ID_MAX + 1u];
     size_t operation_cache_count;
     size_t operation_cache_next;
@@ -539,11 +543,21 @@ static bool xc_recovery_promote_locked(struct xc_service *service)
 
 static unsigned int xc_rate_remaining_seconds_locked(struct xc_service *service)
 {
-    uint64_t now = xc_monotonic_ms(service);
+    uint64_t now;
     uint64_t remaining;
 
-    if (service->rate_deadline_monotonic_ms <= now) return 0u;
-    remaining = service->rate_deadline_monotonic_ms - now;
+    if (service->restored_rate_deadline_wall_ms) {
+        now = xc_wallclock_ms(service);
+        if (service->restored_rate_deadline_wall_ms <= now) {
+            service->restored_rate_deadline_wall_ms = 0u;
+            return 0u;
+        }
+        remaining = service->restored_rate_deadline_wall_ms - now;
+    } else {
+        now = xc_monotonic_ms(service);
+        if (service->rate_deadline_monotonic_ms <= now) return 0u;
+        remaining = service->rate_deadline_monotonic_ms - now;
+    }
     return remaining > (uint64_t)UINT_MAX * 1000u ? UINT_MAX :
            (unsigned int)((remaining + 999u) / 1000u);
 }
@@ -572,6 +586,7 @@ static int xc_set_rate_deadline(struct xc_service *service,
     deadline_wall = now_wall + wait_ms;
     pthread_mutex_lock(&service->lock);
     service->rate_deadline_monotonic_ms = now_monotonic + wait_ms;
+    service->restored_rate_deadline_wall_ms = 0u;
     pthread_mutex_unlock(&service->lock);
     if (!service->ops.phone_rate_save ||
         !xc_store_result_committed(
@@ -619,6 +634,25 @@ static void xc_cameras_clear(struct xc_service *service)
     xc_camera_array_clear(service->cameras, service->camera_count);
     service->cameras = NULL;
     service->camera_count = 0u;
+}
+
+static void xc_selection_clear_locked(struct xc_service *service)
+{
+    xc_cameras_clear(service);
+    service->selection_configured = false;
+    service->selection_account_id[0] = '\0';
+    service->region = service->catalog_region = XC_REGION_CN;
+    service->catalog_state = XC_CATALOG_IDLE;
+    service->has_pending_region = service->has_queued_region = false;
+    service->has_list_error = false;
+    memset(&service->list_error, 0, sizeof(service->list_error));
+    service->selection_enabled = false;
+    service->selected_id[0] = service->selected_name[0] = service->selected_model[0] = '\0';
+    service->selected_channel = 0;
+    service->camera_state = XC_MEDIA_STOPPED;
+    service->camera_codec[0] = '\0';
+    service->has_camera_error = false;
+    memset(&service->camera_error, 0, sizeof(service->camera_error));
 }
 
 static char *xc_staging_strdup(struct xc_service *service, const char *source)
@@ -688,7 +722,15 @@ static int xc_apply_auth_response_locked(struct xc_service *service,
         *error = response->error;
         return -1;
     }
-    if (!strcmp(response->phone_state, "error")) {
+    if (!strcmp(response->phone_state, "sms_required")) {
+        xc_challenge_clear(service);
+        snprintf(service->sms_target, sizeof(service->sms_target), "%s",
+                 response->phone_masked_target);
+        service->sms_code_length = response->phone_code_length;
+        service->auth_state = XC_AUTH_SMS_REQUIRED;
+        if (!response->phone_error[0]) return 0;
+    }
+    if (response->phone_error[0]) {
         const char *category = "provider";
 
         if (!strcmp(response->phone_error, "sms_send_limit_tomorrow") ||
@@ -719,14 +761,6 @@ static int xc_apply_auth_response_locked(struct xc_service *service,
         }
         return -1;
     }
-    if (!strcmp(response->phone_state, "sms_required")) {
-        xc_challenge_clear(service);
-        snprintf(service->sms_target, sizeof(service->sms_target), "%s",
-                 response->phone_masked_target);
-        service->sms_code_length = response->phone_code_length;
-        service->auth_state = XC_AUTH_SMS_REQUIRED;
-        return 0;
-    }
     if (!strcmp(response->phone_state, "authenticated")) {
         xc_challenge_clear(service);
         return 0;
@@ -744,10 +778,6 @@ static int xc_cameras_prepare(struct xc_service *service,
 
     if (!cameras_out) {
         errno = EINVAL;
-        return -1;
-    }
-    if (response->camera_count > 256u) {
-        errno = EOVERFLOW;
         return -1;
     }
     if (response->camera_count && !response->cameras) {
@@ -834,6 +864,47 @@ static int xc_cameras_apply(struct xc_service *service,
     }
     xc_cameras_commit(service, cameras, response->camera_count);
     return 0;
+}
+
+static bool xc_selected_unavailable_locked(const struct xc_service *service)
+{
+    return service->has_camera_error &&
+           !strcmp(service->camera_error.message_key, "selected_camera_unavailable") &&
+           service->selected_id[0];
+}
+
+static void xc_validate_selected_camera_locked(struct xc_service *service)
+{
+    size_t index;
+    char source[512];
+
+    if (!service->selected_id[0] || !service->has_account ||
+        strcmp(service->selection_account_id, service->account.id) ||
+        service->region != service->catalog_region) return;
+    for (index = 0u; index < service->camera_count; ++index) {
+        const struct xc_xiaomi_camera *camera = &service->cameras[index];
+
+        if (strcmp(camera->id, service->selected_id) ||
+            strcmp(camera->model, service->selected_model)) continue;
+        if (xc_camera_source_rebuild(camera->source, service->account.id,
+            xc_region_text(service->region), service->selected_id,
+            service->selected_model, service->selected_channel == 2u ? 2u : 1u,
+            xc_rtsp_effective_audio(service->ops.rtsp), source,
+            sizeof(source)) != 0) break;
+        snprintf(service->selected_name, sizeof(service->selected_name), "%s", camera->name);
+        if (xc_selected_unavailable_locked(service)) {
+            service->has_camera_error = false;
+            memset(&service->camera_error, 0, sizeof(service->camera_error));
+            service->camera_state = service->selection_enabled ?
+                (service->input_available ? XC_MEDIA_STARTING : XC_MEDIA_WAITING_INPUT) :
+                XC_MEDIA_STOPPED;
+        }
+        return;
+    }
+    xc_set_error(&service->camera_error, "media", "selected_camera_unavailable", 0);
+    service->has_camera_error = true;
+    service->camera_state = XC_MEDIA_ERROR;
+    service->camera_codec[0] = '\0';
 }
 
 static bool xc_add_recovery_locked(struct xc_service *service, cJSON *object, bool auth)
@@ -956,7 +1027,7 @@ static int xc_call(struct xc_service *service, struct xc_xiaomi_request *request
 {
     struct xc_cloud_task task = {.service=service, .request=request, .response=response};
     pthread_t thread;
-    bool stopped = false, cancelled;
+    bool stopped = false, cancelled, cancel_sent = false;
     int created = pthread_create(&thread, NULL, xc_cloud_call, &task);
     if (created != 0) {
         xc_set_error(error, "internal", "out_of_memory", 0);
@@ -964,8 +1035,19 @@ static int xc_call(struct xc_service *service, struct xc_xiaomi_request *request
         return -1;
     }
     pthread_mutex_lock(&service->lock);
-    while (!task.done) {
-        if (service->reconcile_requested || (service->stopping && !stopped)) {
+    for (;;) {
+        if (service->auth_cancel_requested && !cancel_sent) {
+            struct xc_xiaomi_request cancel = {.action = XC_XIAOMI_PHONE_CANCEL};
+            struct xc_xiaomi_response cancelled_response = {0};
+            cancel_sent = true;
+            pthread_mutex_unlock(&service->lock);
+            /* Cancel reaches the sidecar while the original HTTP request is
+             * pending; its generation gate prevents late token persistence. */
+            (void)service->ops.xiaomi_call(service->ops.userdata, &cancel, &cancelled_response);
+            xc_xiaomi_response_clear(&cancelled_response);
+            pthread_mutex_lock(&service->lock);
+        } else if (task.done) break;
+        else if (service->reconcile_requested || (service->stopping && !stopped)) {
             service->reconcile_requested = false;
             stopped = service->stopping;
             pthread_mutex_unlock(&service->lock);
@@ -974,7 +1056,7 @@ static int xc_call(struct xc_service *service, struct xc_xiaomi_request *request
             pthread_mutex_lock(&service->lock);
         } else pthread_cond_wait(&service->work_cond, &service->lock);
     }
-    cancelled = service->stopping;
+    cancelled = service->stopping || service->auth_cancel_requested;
     pthread_mutex_unlock(&service->lock);
     pthread_join(thread, NULL);
     if (cancelled) {
@@ -1028,8 +1110,7 @@ static void xc_queue_catalog_locked(struct xc_service *service,
     snprintf(service->work.account_id, sizeof(service->work.account_id), "%s",
              service->account.id);
     service->work.recovery_generation = service->recovery_generation;
-    if (kind == XC_WORK_CAMERA_REGION)
-        service->work.input_generation = service->input_generation;
+    service->work.input_generation = service->input_generation;
     service->pending = true;
     service->catalog_state = XC_CATALOG_QUEUED;
     if (kind == XC_WORK_CAMERA_REGION) {
@@ -1169,7 +1250,10 @@ static void xc_finish_locked(struct xc_service *service, const struct xc_work *w
         if (work->kind <= XC_WORK_CLEAR) {
             service->auth_error = *error;
             service->has_auth_error = true;
-            service->auth_state = XC_AUTH_ERROR;
+            if (service->auth_state != XC_AUTH_SMS_REQUIRED) {
+                service->auth_state = XC_AUTH_ERROR;
+                xc_challenge_clear(service);
+            }
         } else {
             service->camera_error = *error;
             service->has_camera_error = true;
@@ -1254,7 +1338,7 @@ static int xc_reconcile(struct xc_service *service)
         cJSON_Delete(snapshot);
         if (observed.audio_known && !observed.audio_supported &&
             !strcmp(observed.source, service->active_source))
-            audio = strstr(service->active_source, "&audio=1&") != NULL;
+            audio = xc_camera_source_audio_enabled(service->active_source);
     }
     if (source && xc_camera_source_rebuild(target.core_source, target.account_id,
         xc_region_text(target.region), target.camera_id, target.model,
@@ -1274,6 +1358,11 @@ static int xc_reconcile(struct xc_service *service)
         pthread_mutex_unlock(&service->lock);
         if (service->ops.source_set(service->ops.userdata, target.source) != 0) {
             (void)xc_source_stop(service);
+            pthread_mutex_lock(&service->lock);
+            xc_set_error(&service->camera_error, "media", "source_set_failed", 0);
+            service->has_camera_error = true;
+            service->camera_state = XC_MEDIA_ERROR;
+            pthread_mutex_unlock(&service->lock);
             return -1;
         }
     }
@@ -1283,14 +1372,25 @@ static int xc_reconcile(struct xc_service *service)
     if (!xc_input_generation_current(service, input_generation)) ai = false;
     if (!ai) xc_ai_stop(service);
     else if (!service->media_active) {
-        if (service->ops.media_start(service->ops.userdata) != 0) result = -1;
+        pthread_mutex_lock(&service->lock);
+        service->camera_state = XC_MEDIA_STARTING;
+        pthread_mutex_unlock(&service->lock);
+        if (service->ops.media_start(service->ops.userdata) != 0) {
+            pthread_mutex_lock(&service->lock);
+            xc_set_error(&service->camera_error, "media", "media_start_failed", 0);
+            service->has_camera_error = true;
+            service->camera_state = XC_MEDIA_ERROR;
+            pthread_mutex_unlock(&service->lock);
+            result = -1;
+        }
         else service->media_active = true;
         if (!xc_input_generation_current(service, input_generation)) xc_ai_stop(service);
     }
     pthread_mutex_lock(&service->lock);
     if (!service->media_active) {
-        service->camera_state = service->selection_enabled && service->selected_id[0] ?
-                                XC_MEDIA_WAITING_INPUT : XC_MEDIA_STOPPED;
+        if (!service->has_camera_error || service->camera_state != XC_MEDIA_ERROR)
+            service->camera_state = service->selection_enabled && service->selected_id[0] ?
+                                    XC_MEDIA_WAITING_INPUT : XC_MEDIA_STOPPED;
         service->camera_codec[0] = '\0';
     }
     if (changed || result)
@@ -1359,6 +1459,12 @@ static void xc_rtsp_reconnect_error(struct xc_service *service, enum xc_rtsp_err
     const char *reason = xc_rtsp_error_text(error);
     xc_rtsp_error(service->ops.rtsp, error);
     pthread_mutex_lock(&service->lock);
+    if (xc_selected_unavailable_locked(service) ||
+        (error == XC_RTSP_ERROR_RECONNECT && service->has_camera_error &&
+         service->camera_state == XC_MEDIA_ERROR)) {
+        pthread_mutex_unlock(&service->lock);
+        return;
+    }
     service->camera_state = service->input_available ? XC_MEDIA_ERROR : XC_MEDIA_WAITING_INPUT;
     xc_set_error(&service->camera_error, "media", reason, 0);
     service->has_camera_error = true;
@@ -1393,7 +1499,7 @@ static cJSON *xc_rtsp_execute(struct xc_service *service, const struct xc_rtsp_j
         goto done;
     }
     replace = !job->credentials && service->active_source[0] && (!known || supported) &&
-              (strstr(service->active_source, "&audio=1&") != NULL) != desired_audio;
+              xc_camera_source_audio_enabled(service->active_source) != desired_audio;
     /* Release the old audio request before committing a new preference.
      * Failed persistence leaves both branches stopped for this operation. */
     if (replace && xc_source_stop(service) != 0) {
@@ -1429,6 +1535,41 @@ done:
     return response;
 }
 
+/* Invoked once by the catalog completion, never by a status GET. The normal
+ * selection worker owns persistence, host-input preparation and source errors. */
+static void xc_queue_default_camera_locked(struct xc_service *service,
+                                           const struct xc_work *catalog_work)
+{
+    const struct xc_xiaomi_camera *camera;
+    struct xc_work next = {0};
+    if (service->stopping || service->pending || service->active ||
+        service->auth_state != XC_AUTH_AUTHENTICATED || !service->has_account ||
+        service->selected_id[0] || !service->camera_count ||
+        service->region != service->catalog_region) return;
+    camera = &service->cameras[0];
+    if (xc_camera_source_rebuild(camera->source, service->account.id,
+        xc_region_text(service->region), camera->id, camera->model, 1u,
+        xc_rtsp_effective_audio(service->ops.rtsp), next.source, sizeof(next.source)) != 0) {
+        xc_set_error(&service->camera_error, "protocol", "xiaomi_response_invalid", 0);
+        service->has_camera_error = true;
+        service->camera_state = XC_MEDIA_ERROR;
+        return;
+    }
+    next.kind = XC_WORK_CAMERA_SELECT;
+    next.region = service->region;
+    next.input_generation = catalog_work->input_generation;
+    next.background = catalog_work->background;
+    snprintf(next.account_id, sizeof(next.account_id), "%s", service->account.id);
+    snprintf(next.camera_id, sizeof(next.camera_id), "%s", camera->id);
+    snprintf(next.name, sizeof(next.name), "%s", camera->name);
+    snprintf(next.model, sizeof(next.model), "%s", camera->model);
+    snprintf(next.core_source, sizeof(next.core_source), "%s", camera->source);
+    service->work = next;
+    service->pending = true;
+    service->camera_state = XC_MEDIA_STARTING;
+    pthread_cond_signal(&service->work_cond);
+}
+
 static void *xc_worker(void *userdata)
 {
     struct xc_service *service = userdata;
@@ -1443,6 +1584,7 @@ static void *xc_worker(void *userdata)
         bool ok = false;
         bool catalog_loaded = false;
         bool region_committed = false;
+        bool retained_sms_challenge = false;
 
         pthread_mutex_lock(&service->lock);
         while (!service->stopping && !service->pending) {
@@ -1461,6 +1603,7 @@ static void *xc_worker(void *userdata)
         service->pending = false;
         service->active = true;
         service->active_kind = work.kind;
+        work.cancelled_before_start = service->auth_cancel_requested;
         if (!work.background && (work.kind == XC_WORK_CAMERA_LIST ||
             work.kind == XC_WORK_CAMERA_REGION))
             service->catalog_state = XC_CATALOG_LOADING;
@@ -1480,7 +1623,9 @@ static void *xc_worker(void *userdata)
             continue;
         }
 
-        if (work.kind == XC_WORK_CAMERA_SELECT) {
+        if (work.cancelled_before_start && work.kind >= XC_WORK_SMS_START && work.kind < XC_WORK_CANCEL) {
+            xc_set_error(&error, "conflict", "operation_cancelled", 0);
+        } else if (work.kind == XC_WORK_CAMERA_SELECT) {
             uint64_t input_generation = 0u;
 
             /* The durable selection is written before changing the host
@@ -1511,12 +1656,13 @@ static void *xc_worker(void *userdata)
                 if (work.input_generation != service->input_generation) {
                     service->camera_state = XC_MEDIA_WAITING_INPUT;
                     xc_set_error(&error, "conflict", "input_mode_changed", 0);
-                } else {
+                } else if (!work.background) {
                     input_generation = xc_input_prepare_begin_locked(service);
                 }
                 pthread_mutex_unlock(&service->lock);
             }
-            if (!error.category[0] && xc_input_prepare_guarded(service, input_generation, &error) == 0)
+            if (!error.category[0] && (work.background ||
+                xc_input_prepare_guarded(service, input_generation, &error) == 0))
                 ok = true;
         } else if (work.kind == XC_WORK_RECONCILE) {
             ok = true;
@@ -1562,8 +1708,6 @@ static void *xc_worker(void *userdata)
                 }
             }
         } else if (work.kind == XC_WORK_CAMERA_LIST) {
-            size_t selected_index = 0u;
-
             pthread_mutex_lock(&service->lock);
             if (!service->has_account ||
                 strcmp(service->account.id, work.account_id) != 0) {
@@ -1581,44 +1725,7 @@ static void *xc_worker(void *userdata)
                         service->catalog_region = work.region;
                         catalog_loaded = true;
                         ok = true;
-                        if (work.verify_restored_selection) {
-                            for (selected_index = 0u;
-                                 selected_index < service->camera_count;
-                                 ++selected_index)
-                                if (!strcmp(service->cameras[selected_index].id,
-                                            work.camera_id) &&
-                                    !strcmp(service->cameras[selected_index].model,
-                                            work.model))
-                                    break;
-                            if (selected_index == service->camera_count ||
-                                xc_camera_source_rebuild(
-                                    service->cameras[selected_index].source,
-                                    work.account_id, request.region,
-                                    work.camera_id, work.model,
-                                    work.channel == 2u ? 2u : 1u,
-                                    xc_rtsp_effective_audio(service->ops.rtsp),
-                                    work.source, sizeof(work.source)) != 0) {
-                                xc_set_error(&service->camera_error, "media",
-                                             "selected_camera_unavailable", 0);
-                                service->has_camera_error = true;
-                                service->camera_state = XC_MEDIA_ERROR;
-                                service->camera_codec[0] = '\0';
-                            } else {
-                                snprintf(service->selected_name,
-                                         sizeof(service->selected_name), "%s",
-                                         service->cameras[selected_index].name);
-                                snprintf(service->selected_model,
-                                         sizeof(service->selected_model), "%s",
-                                         service->cameras[selected_index].model);
-                                service->has_camera_error = false;
-                                memset(&service->camera_error, 0,
-                                       sizeof(service->camera_error));
-                                if (!service->input_available)
-                                    service->camera_state =
-                                        service->selection_enabled ?
-                                        XC_MEDIA_WAITING_INPUT : XC_MEDIA_STOPPED;
-                            }
-                        }
+                        xc_validate_selected_camera_locked(service);
                     }
                     pthread_mutex_unlock(&service->lock);
                 }
@@ -1757,10 +1864,17 @@ static void *xc_worker(void *userdata)
                     !strcmp(response.phone_state, "authenticated"))
                     needs_accounts = true;
                 if (!strcmp(response.phone_state, "sms_required") &&
+                    !response.phone_error[0] &&
                     xc_set_rate_deadline(service, response.phone_retry_after_seconds,
                                          &error) != 0) {
-                    /* The in-memory deadline was set before this durability
-                     * failure, so a retry cannot emit another SMS. */
+                    struct xc_xiaomi_error ignored = {0};
+                    /* The SMS was sent and its in-memory cooldown is active.
+                     * Keep the challenge so the user can verify or cancel. */
+                    pthread_mutex_lock(&service->lock);
+                    if (!service->auth_cancel_requested &&
+                        xc_apply_auth_response_locked(service, &response, &ignored) == 0)
+                        retained_sms_challenge = true;
+                    pthread_mutex_unlock(&service->lock);
                 } else if (accounts_response) {
                     pthread_mutex_lock(&service->lock);
                     if (!xc_recovery_current_locked(service, &work))
@@ -1773,27 +1887,90 @@ static void *xc_worker(void *userdata)
                     }
                     pthread_mutex_unlock(&service->lock);
 
+                } else if (response.phone_error[0]) {
+                    pthread_mutex_lock(&service->lock);
+                    (void)xc_apply_auth_response_locked(service, &response, &error);
+                    retained_sms_challenge = service->auth_state == XC_AUTH_SMS_REQUIRED;
+                    pthread_mutex_unlock(&service->lock);
                 } else if (needs_accounts) {
                     xc_xiaomi_response_clear(&response);
                     memset(&response, 0, sizeof(response));
                     request.action = XC_XIAOMI_ACCOUNTS;
                     if (xc_call(service, &request, &response, &error) == 0) {
                         pthread_mutex_lock(&service->lock);
-                        if (xc_accounts_apply_locked(service, &response, &error) == 0)
+                        if (work.kind != XC_WORK_CANCEL && response.account_count == 0u)
+                            xc_set_error(&error, "protocol", "xiaomi_token_response_invalid", 0);
+                        else if (!service->auth_cancel_requested &&
+                            xc_accounts_apply_locked(service, &response, &error) == 0)
                             ok = true;
                         pthread_mutex_unlock(&service->lock);
                     }
                 } else {
                     pthread_mutex_lock(&service->lock);
-                    if (xc_apply_auth_response_locked(service, &response, &error) == 0)
+                    if (!service->auth_cancel_requested &&
+                        xc_apply_auth_response_locked(service, &response, &error) == 0)
                         ok = true;
                     pthread_mutex_unlock(&service->lock);
                 }
             }
+            if (local_rate_limited && work.kind == XC_WORK_SMS_RESEND) {
+                pthread_mutex_lock(&service->lock);
+                if (service->sms_code_length && service->sms_target[0]) {
+                    service->auth_state = XC_AUTH_SMS_REQUIRED;
+                    retained_sms_challenge = true;
+                }
+                pthread_mutex_unlock(&service->lock);
+            }
         }
         xc_xiaomi_response_clear(&response);
 
+        if (!ok && work.kind >= XC_WORK_SMS_START && work.kind < XC_WORK_CANCEL &&
+            !retained_sms_challenge &&
+            (error.kind == XC_XIAOMI_ERROR_NETWORK || error.kind == XC_XIAOMI_ERROR_PROTOCOL)) {
+            struct xc_xiaomi_request cancel = {.action = XC_XIAOMI_PHONE_CANCEL};
+            struct xc_xiaomi_response cancelled_response = {0};
+            /* A local RPC timeout is not evidence the sidecar stopped. Revoke
+             * its lease and remove any unconfirmed committed token before a
+             * corrected login can be admitted; never replay credentials. */
+            (void)service->ops.xiaomi_call(service->ops.userdata, &cancel, &cancelled_response);
+            xc_xiaomi_response_clear(&cancelled_response);
+            if (!service->ops.sidecar_reset || service->ops.sidecar_reset(service->ops.userdata, true) != 0)
+                xc_set_error(&error, "internal", "sidecar_reset_failed", 0);
+        }
+
         pthread_mutex_lock(&service->lock);
+        if (service->auth_cancel_requested && work.kind <= XC_WORK_CLEAR) {
+            bool clear;
+            int result;
+            const char *failure_key = "sidecar_reset_failed";
+            pthread_mutex_unlock(&service->lock);
+            /* Also clears a token committed immediately before cancellation
+             * won the local lock. No new login is admitted until reset ends. */
+            result = service->ops.sidecar_reset ? service->ops.sidecar_reset(service->ops.userdata, true) : -1;
+            pthread_mutex_lock(&service->lock);
+            clear = service->auth_cancel_clear;
+            if (result == 0 && clear) {
+                pthread_mutex_unlock(&service->lock);
+                result = service->ops.persist_selection ? service->ops.persist_selection(service->ops.userdata, NULL, NULL, false, false, "", "", "", 0u) : -1;
+                failure_key = "selection_persist_failed";
+                pthread_mutex_lock(&service->lock);
+            }
+            service->auth_cancel_requested = false;
+            service->auth_cancel_clear = false;
+            xc_accounts_clear(service);
+            xc_challenge_clear(service);
+            service->auth_state = result >= 0 ? XC_AUTH_IDLE : XC_AUTH_ERROR;
+            service->auth_reason = XC_AUTH_REASON_NONE;
+            service->has_auth_error = result < 0;
+            if (result >= 0 && clear) xc_selection_clear_locked(service);
+            if (result < 0) xc_set_error(&service->auth_error, "internal", failure_key, 0);
+            else memset(&service->auth_error, 0, sizeof(service->auth_error));
+            xc_finish_locked(service, &work, true, NULL, XC_RECOVERY_NONE);
+            pthread_mutex_unlock(&service->lock);
+            xc_persist_status(service);
+            xc_secure_clear(&work, sizeof(work));
+            continue;
+        }
         if ((xc_catalog_work(work.kind) || work.kind == XC_WORK_REFRESH) &&
             (service->stopping || work.recovery_generation != service->recovery_generation)) {
             /* A new region/selection/stop owns the state. Discard the old
@@ -1821,22 +1998,7 @@ static void *xc_worker(void *userdata)
                 service->has_auth_error = false;
                 memset(&service->auth_error, 0, sizeof(service->auth_error));
                 if (work.kind == XC_WORK_CLEAR) {
-                    xc_cameras_clear(service);
-                    service->selection_configured = false;
-                    service->selection_account_id[0] = '\0';
-                    service->region = XC_REGION_CN;
-                    service->catalog_region = XC_REGION_CN;
-                    service->catalog_state = XC_CATALOG_IDLE;
-                    service->has_pending_region = false;
-                    service->has_list_error = false;
-                    memset(&service->list_error, 0, sizeof(service->list_error));
-                    service->selection_enabled = false;
-                    service->selected_id[0] = '\0';
-                    service->selected_name[0] = '\0';
-                    service->selected_model[0] = '\0';
-                    service->selected_channel = 0u;
-                    service->camera_state = XC_MEDIA_STOPPED;
-                    service->camera_codec[0] = '\0';
+                    xc_selection_clear_locked(service);
                 }
             } else if (work.kind == XC_WORK_CAMERA_LIST ||
                        work.kind == XC_WORK_CAMERA_REGION) {
@@ -1850,8 +2012,11 @@ static void *xc_worker(void *userdata)
                            sizeof(service->camera_error));
                 }
             } else {
-                service->has_camera_error = false;
-                memset(&service->camera_error, 0, sizeof(service->camera_error));
+                if (work.kind == XC_WORK_CAMERA_SELECT ||
+                    !xc_selected_unavailable_locked(service)) {
+                    service->has_camera_error = false;
+                    memset(&service->camera_error, 0, sizeof(service->camera_error));
+                }
                 if (work.kind == XC_WORK_CAMERA_SELECT) {
                     snprintf(service->selected_id, sizeof(service->selected_id), "%s",
                              work.camera_id);
@@ -1861,10 +2026,10 @@ static void *xc_worker(void *userdata)
                              work.model);
                     service->selected_channel = work.channel;
                     service->selection_enabled = true;
-                    service->camera_state = XC_MEDIA_STARTING;
                 } else if (work.kind == XC_WORK_CAMERA_STOP) {
                     service->selection_enabled = false;
-                    service->camera_state = XC_MEDIA_STOPPED;
+                    if (!xc_selected_unavailable_locked(service))
+                        service->camera_state = XC_MEDIA_STOPPED;
 
                 }
             }
@@ -1896,6 +2061,8 @@ static void *xc_worker(void *userdata)
         }
         xc_finish_locked(service, &work, ok, &error,
                          recovery_result);
+        if (catalog_loaded && !region_committed)
+            xc_queue_default_camera_locked(service, &work);
         if (ok && work.kind <= XC_WORK_CLEAR && work.kind != XC_WORK_CLEAR &&
             service->has_account && !service->pending) {
             if (service->selection_configured &&
@@ -1908,19 +2075,6 @@ static void *xc_worker(void *userdata)
             } else if (service->selection_configured) {
                 xc_queue_catalog_locked(service, XC_WORK_CAMERA_LIST,
                                         service->region);
-                if (service->pending && service->selected_id[0]) {
-                    service->work.verify_restored_selection = true;
-                    snprintf(service->work.camera_id,
-                             sizeof(service->work.camera_id), "%s",
-                             service->selected_id);
-                    snprintf(service->work.name,
-                             sizeof(service->work.name), "%s",
-                             service->selected_name);
-                    snprintf(service->work.model,
-                             sizeof(service->work.model), "%s",
-                             service->selected_model);
-                    service->work.channel = service->selected_channel;
-                }
             } else {
                 xc_queue_catalog_locked(service, XC_WORK_CAMERA_LIST,
                                         XC_REGION_CN);
@@ -2192,12 +2346,28 @@ static cJSON *xc_queue_auth(struct xc_service *service, enum xc_work_kind kind,
                               "route_body_invalid", "mutation body is invalid");
     }
     pthread_mutex_lock(&service->lock);
+    if (service->stopping) {
+        pthread_mutex_unlock(&service->lock);
+        xc_secure_clear(national_copy, sizeof(national_copy));
+        return xc_route_error(AINICE_PROTOCOL_ERROR_BUSY, "busy", "service is stopping");
+    }
     if (xc_operation_cached_locked(service, operation_id)) {
         pthread_mutex_unlock(&service->lock);
         xc_secure_clear(national_copy, sizeof(national_copy));
         return xc_operation(operation_id, "working", NULL);
     }
     if (service->pending || service->active) {
+        enum xc_work_kind busy_kind = service->active ? service->active_kind : service->work.kind;
+        if ((kind == XC_WORK_CANCEL || kind == XC_WORK_CLEAR) && !service->has_account &&
+            busy_kind >= XC_WORK_SMS_START && busy_kind < XC_WORK_CANCEL) {
+            service->auth_cancel_requested = true;
+            service->auth_cancel_clear = service->auth_cancel_clear || kind == XC_WORK_CLEAR;
+            xc_operation_record_locked(service, operation_id);
+            pthread_cond_broadcast(&service->work_cond);
+            pthread_mutex_unlock(&service->lock);
+            xc_secure_clear(national_copy, sizeof(national_copy));
+            return xc_operation(operation_id, "working", NULL);
+        }
         pthread_mutex_unlock(&service->lock);
         xc_secure_clear(national_copy, sizeof(national_copy));
         return xc_route_error(AINICE_PROTOCOL_ERROR_BUSY,
@@ -2215,6 +2385,11 @@ static cJSON *xc_queue_auth(struct xc_service *service, enum xc_work_kind kind,
         xc_secure_clear(national_copy, sizeof(national_copy));
         return xc_route_error(AINICE_PROTOCOL_ERROR_CONFLICT,
                               "conflict", "sms step does not match");
+    }
+    if ((kind == XC_WORK_SMS_VERIFY &&
+         (!xc_decimal_text(code, XC_CODE_MAX) || strlen(code) != service->sms_code_length))) {
+        pthread_mutex_unlock(&service->lock);
+        return xc_route_error(AINICE_PROTOCOL_ERROR_ROUTE_BODY_INVALID, "route_body_invalid", "verification code is invalid");
     }
     if ((kind == XC_WORK_SMS_START || kind == XC_WORK_SMS_RESEND) &&
         xc_rate_active_locked(service)) {
@@ -2237,7 +2412,9 @@ static cJSON *xc_queue_auth(struct xc_service *service, enum xc_work_kind kind,
     xc_recovery_generation_advance_locked(service);
     xc_operation_record_locked(service, operation_id);
     service->pending = true;
-    xc_challenge_clear(service);
+    if (kind == XC_WORK_CANCEL || kind == XC_WORK_CLEAR ||
+        kind == XC_WORK_SMS_START)
+        xc_challenge_clear(service);
     service->auth_state = XC_AUTH_WORKING;
     service->auth_reason = kind == XC_WORK_SMS_VERIFY ?
                            XC_AUTH_REASON_SMS_VERIFY :
@@ -2341,7 +2518,12 @@ static cJSON *xc_queue_camera(struct xc_service *service, enum xc_work_kind kind
     xc_operation_record_locked(service, operation_id);
     service->pending = true;
     if (kind == XC_WORK_CAMERA_SELECT) {
-        service->camera_state = XC_MEDIA_STARTING;
+        /* Reselecting the active target does not start a new media session,
+         * so it cannot rely on a second RUNNING callback to restore state. */
+        if (!service->selection_enabled || !service->input_available ||
+            service->selected_channel != channel ||
+            strcmp(service->active_core_source, service->work.core_source))
+            service->camera_state = XC_MEDIA_STARTING;
         service->has_camera_error = false;
         memset(&service->camera_error, 0, sizeof(service->camera_error));
     }
@@ -2544,8 +2726,6 @@ int xc_service_create(struct xc_service **service_out, const struct xc_service_o
     service->camera_state = XC_MEDIA_STOPPED;
     if (service->ops.phone_rate_load) {
         uint64_t persisted_deadline = 0u;
-        uint64_t now_wall;
-        uint64_t now_monotonic;
 
         if (service->ops.phone_rate_load(service->ops.userdata,
                                          &persisted_deadline) != 0) {
@@ -2555,13 +2735,7 @@ int xc_service_create(struct xc_service **service_out, const struct xc_service_o
             free(service);
             return -1;
         }
-        now_wall = xc_wallclock_ms(service);
-        now_monotonic = xc_monotonic_ms(service);
-        if (persisted_deadline > now_wall &&
-            persisted_deadline - now_wall <= UINT64_MAX - now_monotonic) {
-            service->rate_deadline_monotonic_ms =
-                now_monotonic + (persisted_deadline - now_wall);
-        }
+        service->restored_rate_deadline_wall_ms = persisted_deadline;
     }
     if (pthread_create(&service->worker, NULL, xc_worker, service) != 0) {
         pthread_cond_destroy(&service->work_cond);
@@ -2577,6 +2751,10 @@ void xc_service_media_state(struct xc_service *service, enum xc_media_state stat
 {
     if (!service) return;
     pthread_mutex_lock(&service->lock);
+    if (xc_selected_unavailable_locked(service)) {
+        pthread_mutex_unlock(&service->lock);
+        return;
+    }
     if (state >= XC_MEDIA_STOPPED && state <= XC_MEDIA_ERROR) {
         if (state != XC_MEDIA_ERROR && !service->input_available &&
             service->selection_enabled)
@@ -2622,7 +2800,7 @@ void xc_service_restore_selection(struct xc_service *service,
     if (!service || !xc_decimal_text(account_id, XC_ACCOUNT_ID_MAX) ||
         xc_region_parse(region, &parsed_region) != 0 ||
         (enabled && !selected) ||
-        (selected && (!xc_decimal_text(camera_id, XC_CAMERA_ID_MAX) ||
+        (selected && (!xc_text(camera_id, XC_CAMERA_ID_MAX) ||
                       !xc_text(model, XC_CAMERA_MODEL_MAX))) ||
         (!selected && (enabled || (camera_id && camera_id[0]) || channel != 0u)) ||
         (channel != 0u && channel != 2u)) return;
@@ -2662,7 +2840,8 @@ void xc_service_input_changed(struct xc_service *service, bool bitstream)
             service->ai_cancel_requested = true;
             service->ops.media_request_stop(service->ops.userdata);
             service->camera_codec[0] = '\0';
-            if (service->selected_id[0] && service->selection_enabled)
+            if (service->selected_id[0] && service->selection_enabled &&
+                !xc_selected_unavailable_locked(service))
                 service->camera_state = XC_MEDIA_WAITING_INPUT;
         }
         xc_queue_recover_locked(service);
@@ -2676,6 +2855,11 @@ void xc_service_stop(struct xc_service *service)
 {
     if (!service) return;
     pthread_mutex_lock(&service->lock);
+    if (!service->has_account) {
+        enum xc_work_kind kind = service->active ? service->active_kind : service->pending ? service->work.kind : XC_WORK_NONE;
+        if (kind >= XC_WORK_SMS_START && kind < XC_WORK_CANCEL)
+            service->auth_cancel_requested = true;
+    }
     xc_recovery_generation_advance_locked(service);
     service->stopping = true;
     service->ai_cancel_requested = true;

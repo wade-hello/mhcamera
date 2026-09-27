@@ -13,15 +13,16 @@ GO2RTC_AIV1_OUTPUT_PATCH_SHA256=bf94ae2a2eb3bb3693b022936db02656c11e1d6cc7e626b3
 # Xiaomi Passport phone/SMS bootstrap: separate Passport CookieJar, EUI,
 # native XiaomiIO LoginWithToken handoff, and rotated-token persistence.
 GO2RTC_XIAOMI_PHONE_PATCH=0003-xiaomi-phone-bootstrap.patch
-GO2RTC_XIAOMI_PHONE_PATCH_SHA256=bef41cd6daa78b0d6feb88dcfaa83f458d6ebaead83b74b08d6ff5fa716db838
-# Complete Xiaomi device pagination with validated cursors, atomic snapshots,
-# and duplicate-camera conflict detection.
+GO2RTC_XIAOMI_PHONE_PATCH_SHA256=5c6247ce6b4524a4ce375e19515296f1d20c99e89745b4b6b7230550fc4ececa
+# Complete Xiaomi device pagination with validated cursors and atomic snapshots;
+# device entries are filtered independently and duplicate DIDs are reconciled.
 GO2RTC_XIAOMI_DEVICE_PAGINATION_PATCH=0004-xiaomi-device-list-pagination.patch
-GO2RTC_XIAOMI_DEVICE_PAGINATION_PATCH_SHA256=48255b0317508098a9a08f5627d4906d1ae95cb70b4e18db27ab87ce6e807a74
+GO2RTC_XIAOMI_DEVICE_PAGINATION_PATCH_SHA256=9a526490a38d58fc6b7f85d8b10ce28268645523e93aa7d76199a96d57b9a1dc
 # Strict six-region, device-authoritative Xiaomi catalogs with optional atomic
-# home/room location enrichment.
+# home/room location enrichment, and no source entry that the plugin must
+# discard for a missing or unusable IPv4 host.
 GO2RTC_XIAOMI_HOME_ROOM_PATCH=0005-xiaomi-home-room-metadata.patch
-GO2RTC_XIAOMI_HOME_ROOM_PATCH_SHA256=05d388cafc5bbd340fc14af72f3e49aee91a90dcf157d642fa97f4b46c1cfacc
+GO2RTC_XIAOMI_HOME_ROOM_PATCH_SHA256=d333563771d34d1d42a574e4ab8034abfb0d62c028ded4dba9ae6fdc6443e808
 # Typed Xiaomi Cloud errors, single-flight session renewal, and atomic
 # persistence of rotated passToken credentials.
 GO2RTC_XIAOMI_SESSION_RENEWAL_PATCH=0006-xiaomi-cloud-session-renewal.patch
@@ -49,7 +50,10 @@ GO2RTC_XIAOMI_CS2_CLOSE_MESSAGES_UPSTREAM_COMMIT=366cbd200d3b30bea9c7d88b36385d8
 # single-viewer RTSP/TCP share prepared video/audio tracks with generation-safe
 # teardown, typed capability/state, and bounded authenticated protocol handling.
 GO2RTC_CAMERA_SOURCE_RTSP_OUTPUT_PATCH=0010-camera-source-rtsp-output.patch
-GO2RTC_CAMERA_SOURCE_RTSP_OUTPUT_PATCH_SHA256=cc387f7ed6bb13f7153efbbb3dd72ce1d162f728e2ae95c5942ad5f159858e2f
+GO2RTC_CAMERA_SOURCE_RTSP_OUTPUT_PATCH_SHA256=451bf95259a7b114ca2ca7229c3287182b835f3c120264d7c8ef2efed6d90cfa
+# CS2 behavior tied to this upstream pin: P2P transport negotiation, 10s record
+# deadline, 250-packet UDP reorder window, 2 MiB record limit (patch 0008),
+# and 1s source retry spacing (patch 0010). Re-verify when upgrading go2rtc.
 GO_VERSION=1.24.0
 GO_HOST_ARCHIVE_URL=https://go.dev/dl/go1.24.0.linux-amd64.tar.gz
 GO_HOST_ARCHIVE_SHA256=dea9ca38a0b852a74e81c26134671af7c0fbe65d81b0dc1c5bfe22cf7d4c8858

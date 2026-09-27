@@ -54,7 +54,6 @@ const messages = {
     rtspSaved: "RTSP 设置已保存",
     rtspAudioEnabled: "音频已开启",
     rtspAudioDisabled: "音频已关闭",
-    rtspReconnectRequested: "{setting}，摄像头正在重新连接；已有 RTSP 连接需要重新连接。",
     rtspReadFailed: "无法读取 RTSP 状态，请检查设备连接。",
     rtspWriteFailed: "设置未能完成，请重试。下方显示设备最后确认的设置。",
     rtspRuntimeFailed: "RTSP 服务启动失败，请检查端口占用或设备状态。",
@@ -87,6 +86,11 @@ const messages = {
     waiting_input: "等待码流",
     error: "异常",
     authPanel: "账号授权",
+    cameraUnauthorized: "请先授权",
+    cameraLoading: "正在获取摄像头…",
+    cameraEmpty: "找不到摄像头",
+    cameraLoadFailed: "获取摄像头失败",
+    cameraChoose: "请选择摄像头",
     callingCode: "国家或地区",
     nationalNumber: "米家手机号",
     getSmsCode: "获取短信验证码",
@@ -152,6 +156,10 @@ const messages = {
     catalog_incomplete: "摄像头目录暂时不完整，插件正在自动重试",
     catalog_retry_exhausted: "摄像头目录仍不完整，插件已自动重试 3 次",
     selected_camera_unavailable: "已保存的摄像头在当前地区不可用",
+    source_set_failed: "无法设置摄像头视频源，请检查设备状态后重新选择摄像头。",
+    media_start_failed: "摄像头视频启动失败，请检查设备和连接后重试选择。",
+    media_session_failed: "摄像头视频会话失败，请检查设备和连接后重试选择。",
+    selection_persist_failed: "摄像头配置保存失败，请检查设备存储后重试。",
     sms_send_limit_tomorrow: "验证码发送过多，请明天再试",
     statusUnavailable: "暂时无法读取小米摄像头状态"
   },
@@ -171,7 +179,6 @@ const messages = {
     rtspSaved: "RTSP setting saved",
     rtspAudioEnabled: "Audio enabled",
     rtspAudioDisabled: "Audio disabled",
-    rtspReconnectRequested: "{setting}. The camera is reconnecting; existing RTSP connections need to reconnect.",
     rtspReadFailed: "Cannot read RTSP status. Check the device connection.",
     rtspWriteFailed: "The change could not be completed. Retry; the last confirmed setting is shown below.",
     rtspRuntimeFailed: "RTSP could not start. Check port availability or device status.",
@@ -204,6 +211,11 @@ const messages = {
     waiting_input: "Waiting for bitstream",
     error: "Error",
     authPanel: "Account authorization",
+    cameraUnauthorized: "Authorize an account first",
+    cameraLoading: "Loading cameras…",
+    cameraEmpty: "No cameras found",
+    cameraLoadFailed: "Failed to load cameras",
+    cameraChoose: "Select a camera",
     callingCode: "Country or region",
     nationalNumber: "Local phone number",
     getSmsCode: "Get SMS code",
@@ -269,6 +281,10 @@ const messages = {
     catalog_incomplete: "The camera catalog is temporarily incomplete. The plugin is retrying automatically.",
     catalog_retry_exhausted: "The camera catalog is still incomplete after 3 automatic retries.",
     selected_camera_unavailable: "The saved camera is unavailable in this region.",
+    source_set_failed: "Could not set the camera video source. Check the device status and select the camera again.",
+    media_start_failed: "Could not start camera video. Check the device and connection, then select the camera again.",
+    media_session_failed: "Camera video session failed. Check the device and connection, then select the camera again.",
+    selection_persist_failed: "Could not save camera settings. Check device storage and retry.",
     sms_send_limit_tomorrow: "Too many verification codes have been sent. Please try again tomorrow.",
     statusUnavailable: "Xiaomi camera status is temporarily unavailable"
   }
@@ -301,11 +317,13 @@ let cameraListError = null;
 let cameraRegion = "cn";
 let pendingCameraRegion = null;
 let cameraRenderKey = "";
-let renderedCameraRegion = "";
 let regionRenderKey = "";
 let authAttemptActive = false;
 let pendingAuthAction = "";
+let pendingAuthAccepted = false;
+let authRevision = 0;
 let pendingCancel = false;
+let catalogReadFailed = false;
 let catalogPromise = null;
 let catalogLoaded = false;
 let pollTimer = 0;
@@ -673,19 +691,30 @@ function renderCameraSelect() {
   const selected =
     (queuedSelection?.region === displayedRegion ? queuedSelection.cameraId : "") ||
     (selectionInFlight?.region === displayedRegion ? selectionInFlight.cameraId : "") ||
-    (cameraStatus?.selected?.region === displayedRegion ? cameraStatus.selected.id : "") ||
-    (renderedCameraRegion === displayedRegion ? select.value : "");
+    (cameraStatus?.selected?.region === displayedRegion ? cameraStatus.selected.id : "");
+  const authorized = auth.state_code === AuthState.AUTHENTICATED && Boolean(auth.account);
+  const placeholder = !authorized ? "cameraUnauthorized"
+    : cameraListState === CatalogState.ERROR || catalogReadFailed ? "cameraLoadFailed"
+    : CATALOG_ACTIVE_STATES.has(cameraListState) || cameraListState === CatalogState.IDLE || cameraListState === CatalogState.RETRYING || regionInFlight || queuedRegion || pendingCameraRegion ? "cameraLoading"
+    : !items.length ? "cameraEmpty" : !items.some((camera) => camera.id === selected) ? "cameraChoose" : "";
   const nextKey = JSON.stringify([
     language,
     cameraListState,
     selectedRegion(),
     selected,
+    placeholder,
     items.map((item) => [item.id, item.name, item.model, item.home_id, item.home_name, item.room_id, item.room_name])
   ]);
   if (nextKey === cameraRenderKey) return;
   cameraRenderKey = nextKey;
-  renderedCameraRegion = displayedRegion;
   select.replaceChildren();
+  if (placeholder) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = t(placeholder);
+    option.disabled = true;
+    select.append(option);
+  }
   const groups = new Map();
   for (const camera of items) {
     const key = JSON.stringify([camera.home_id, camera.home_name, camera.room_id, camera.room_name]);
@@ -705,7 +734,7 @@ function renderCameraSelect() {
   }
   const hasSelected = items.some((camera) => camera.id === selected);
   if (hasSelected) select.value = selected;
-  else select.selectedIndex = -1;
+  else select.value = "";
 }
 function selectedChannel() { return Number(app.querySelector('input[name="camera-channel"]:checked')?.value || 1); }
 function renderCamera() {
@@ -758,19 +787,17 @@ function renderBusy() {
   const verify = app.querySelector("[data-action='sms-verify']");
   if (verify) verify.disabled = authBusy || cancelBusy;
   const clear = app.querySelector("[data-action='clear']");
-  if (clear) clear.disabled = anyAuthMutation || listBusy || regionBusy || gate.has("camera-start");
+  if (clear) clear.disabled = anyAuthMutation || regionBusy || gate.has("camera-start");
   ref("camera-region").disabled = !authorized || anyAuthMutation || clearBusy;
   ref("camera-select").disabled = !authorized || anyAuthMutation || listBusy || regionBusy || !visibleCameras().length;
   ref("channel-field").disabled = !authorized || anyAuthMutation || listBusy || regionBusy || !ref("camera-select").value;
   const cancelAuthorization = app.querySelector("[data-action='auth-cancel']");
-  if (cancelAuthorization) cancelAuthorization.disabled = authBusy || cancelBusy;
+  if (cancelAuthorization) cancelAuthorization.disabled = cancelBusy || clearBusy;
 }
 
 function renderSmsChallenge() {
   if (auth.state_code === AuthState.SMS_REQUIRED && auth?.challenge?.kind === "sms") {
-    const challenge = auth.challenge;
-    const smsCode = ref("sms-code");
-    smsCode.maxLength = challenge.code_length;
+    ref("sms-code").maxLength = auth.challenge.code_length;
   }
 }
 function renderRtsp() {
@@ -828,8 +855,7 @@ function changeRtspSetting(field) {
       const savedKey = field === "audio_enabled"
         ? (rtsp.audio_enabled ? "rtspAudioEnabled" : "rtspAudioDisabled")
         : "rtspSaved";
-      feedback("success", rtsp.reconnect_requested ? "rtspReconnectRequested" : savedKey,
-        "", "", { setting: t(savedKey) });
+      feedback("success", savedKey);
     } catch (error) {
       rtspWriteFailed = true;
       showError(error);
@@ -963,7 +989,11 @@ function focusAuthChallenge() {
   });
 }
 function projectAuth(result) {
+  const previousChallenge = auth.challenge;
   auth = normalizeAuthResult(result);
+  if (previousChallenge?.kind !== auth.challenge?.kind || previousChallenge?.masked_target !== auth.challenge?.masked_target) {
+    consumeSecret(ref("sms-code"));
+  }
   const notice = reauthNoticeTransition(auth.state_code, reauthNoticeShown);
   reauthNoticeShown = notice.shown;
   if (notice.show) {
@@ -991,19 +1021,22 @@ function projectCameraList(result) {
 function settleAuthorizationFlow() {
   if (pendingCancel) return;
   if (auth.state_code === AuthState.SMS_REQUIRED) {
-    if (pendingAuthAction === "resend") feedback("success", "smsResent", "auth-step", "resend");
-    else if (pendingAuthAction === "start") {
-      feedback("success", "smsSent", "auth-step", "start");
-    }
+    const changed = Boolean(pendingAuthAction);
+    if (changed && !pendingAuthAccepted) return;
+    if (auth.last_error && changed) showError(auth.last_error, "auth-step");
+    else if (pendingAuthAction === "resend") feedback("success", "smsResent", "auth-step", "resend");
+    else if (pendingAuthAction === "start") feedback("success", "smsSent", "auth-step", "start");
     pendingAuthAction = "";
+    pendingAuthAccepted = false;
     authAttemptActive = true;
     render();
-    focusAuthChallenge();
+    if (changed) focusAuthChallenge();
     return;
   }
   if (!authAttemptActive) return;
   if (auth.state_code === AuthState.AUTHENTICATED) {
     pendingAuthAction = "";
+    pendingAuthAccepted = false;
     feedback("success", "authorizationSucceeded", "auth-terminal", "authenticated");
     clearAuthorizationSecrets();
     render();
@@ -1014,11 +1047,13 @@ function settleAuthorizationFlow() {
     catalogLoaded = false;
   } else if (auth.state_code === AuthState.ERROR) {
     pendingAuthAction = "";
+    pendingAuthAccepted = false;
     showError(auth.last_error || { message_key: "request_failed" }, "auth-terminal");
     clearAuthorizationSecrets();
     render();
   } else if (auth.state_code === AuthState.IDLE) {
     pendingAuthAction = "";
+    pendingAuthAccepted = false;
     feedback("error", "authorizationInterrupted", "auth-terminal", "idle");
     clearAuthorizationSecrets();
     render();
@@ -1028,9 +1063,16 @@ function settleAuthorizationFlow() {
 }
 function runAuthorizationMutation(key, task) {
   if (!authInteractionPolicy(auth.state_code, authAttemptActive).attemptActive) return Promise.resolve();
+  const revision = ++authRevision;
   render();
-  const promise = gate.run(key, task).then(() => schedulePoll(120)).catch((error) => {
+  const promise = gate.run(key, task).then(() => {
+    if (revision !== authRevision) return;
+    pendingAuthAccepted = true;
+    schedulePoll(120);
+  }).catch((error) => {
+    if (revision !== authRevision) return;
     pendingAuthAction = "";
+    pendingAuthAccepted = false;
     showError(error, "auth-terminal");
     if (key === "auth-sms-start") clearAuthorizationSecrets();
   }).finally(render);
@@ -1038,8 +1080,12 @@ function runAuthorizationMutation(key, task) {
   return promise;
 }
 function cancelAuthorizationAttempt() {
+  if (pendingCancel || gate.has("auth-cancel")) return Promise.resolve();
+  ++authRevision;
   pendingCancel = true;
   pendingAuthAction = "";
+  pendingAuthAccepted = false;
+  clearAuthorizationSecrets();
   const promise = gate.run("auth-cancel", (operationId) => api.cancelAuthorization(operationId))
     .then(() => schedulePoll(120))
     .catch((error) => {
@@ -1053,12 +1099,16 @@ function cancelAuthorizationAttempt() {
 
 function loadCameraList(refresh) {
   if (catalogPromise) return catalogPromise;
+  const revision = authRevision;
   let tracked;
   const request = (async () => {
     let requestRefresh = refresh;
     while (true) {
       await waitForVisibleDocument(document);
+      if (revision !== authRevision || auth.state_code !== AuthState.AUTHENTICATED) return null;
       const result = await api.cameraList(requestRefresh);
+      if (revision !== authRevision || auth.state_code !== AuthState.AUTHENTICATED) return null;
+      catalogReadFailed = false;
       requestRefresh = false;
       const projection = projectCameraList(result);
       render();
@@ -1084,6 +1134,8 @@ function loadCameraList(refresh) {
     }
   })();
   tracked = request.catch((error) => {
+    if (revision !== authRevision) return null;
+    catalogReadFailed = true;
     catalogLoaded = false;
     if (errorMessageKey(error) !== "busy") {
       showError(error, "camera-list-terminal");
@@ -1205,7 +1257,7 @@ function queueSelectionFromControls() {
   render();
 }
 function applyQueuedSelection() {
-  if (!queuedSelection || gate.has("camera-start")) return Promise.resolve();
+  if (!queuedSelection || gate.has("camera-start") || pendingClear || auth.state_code !== AuthState.AUTHENTICATED) return Promise.resolve();
   const selection = queuedSelection;
   const previousSelection = selectionInFlight;
   queuedSelection = null;
@@ -1254,6 +1306,7 @@ function continueQueuedSelection() {
 }
 function settlePendingMediaAction() {
   if (cameraStatus.state_code === MediaState.ERROR) {
+    if (!pendingMediaAction) return;
     showError(cameraStatus.last_error || { message_key: "request_failed" }, "camera-state");
     pendingMediaAction = "";
     selectionInFlight = null;
@@ -1280,6 +1333,8 @@ function settlePendingMediaAction() {
   }
 }
 function clearAuthorization() {
+  ++authRevision;
+  cancelQueuedSelection();
   pendingClear = true;
   notices.clear("clear-action");
   const promise = gate.run("auth-clear", (operationId) => api.clearAuthorization(operationId)).then(() => schedulePoll(120)).catch((error) => {
@@ -1301,6 +1356,7 @@ function settlePendingClear() {
   cameraStatus = { state_code: MediaState.STOPPED, selected: null, codec: null, last_error: null };
   cameras = [];
   cameraListState = CatalogState.IDLE;
+  catalogReadFailed = false;
   cameraRegion = "cn";
   pendingCameraRegion = null;
   cameraRenderKey = "";
@@ -1318,8 +1374,12 @@ function settlePendingClear() {
   queueMicrotask(() => ref("national-number")?.focus());
 }
 function settlePendingCancel() {
-  if (!pendingCancel || [AuthState.WORKING, AuthState.SMS_REQUIRED].includes(auth.state_code)) return;
+  if (!pendingCancel || gate.has("auth-cancel") || [AuthState.WORKING, AuthState.SMS_REQUIRED].includes(auth.state_code)) return;
   pendingCancel = false;
+  if (auth.state_code === AuthState.ERROR) {
+    showError(auth.last_error || { message_key: "request_failed" }, "auth-cancel");
+    return;
+  }
   if (auth.state_code === AuthState.IDLE) {
     clearAuthorizationSecrets();
     feedback("success", "authorizationCanceled", "auth-cancel", "idle");
@@ -1360,11 +1420,14 @@ function bindEvents() {
   });
   app.querySelector("[data-form='phone']").addEventListener("submit", (event) => {
     event.preventDefault();
+    if (authorizationMutationBusy() || pendingCancel || pendingClear) return;
     if (auth.account || [AuthState.REAUTH_REQUIRED, AuthState.RETRYING].includes(auth.state_code)) return;
     if (auth.state_code === AuthState.WORKING) return;
     if (auth.state_code === AuthState.SMS_REQUIRED && auth.challenge?.kind === "sms") {
       if (auth.challenge.retry_after_seconds > 0) return;
+      notices.clear("auth-step");
       pendingAuthAction = "resend";
+      pendingAuthAccepted = false;
       void runAuthorizationMutation("auth-sms-resend", (operationId) => api.resendSms(operationId));
       return;
     }
@@ -1387,22 +1450,26 @@ function bindEvents() {
     notices.clear("auth-cancel");
     authAttemptActive = true;
     pendingAuthAction = "start";
+    pendingAuthAccepted = false;
     void runAuthorizationMutation("auth-sms-start", (operationId) => api.startSms(operationId, phone.calling_code, phone.national_number));
   });
   app.querySelector("[data-form='sms']").addEventListener("submit", (event) => {
     event.preventDefault();
+    if (auth.state_code !== AuthState.SMS_REQUIRED || authorizationMutationBusy() || pendingCancel || pendingClear) return;
     const challenge = auth?.challenge;
     const submittedCode = consumeSecret(ref("sms-code"), true);
     let code;
     try {
-      code = normalizeSmsCode(submittedCode, challenge?.code_length);
+      code = normalizeSmsCode(submittedCode, challenge.code_length);
     } catch {
-      feedback("warning", "invalidSmsCode", "", "", { length: challenge?.code_length || "-" });
+      feedback("warning", "invalidSmsCode", "", "", { length: challenge.code_length });
       focusInvalid(ref("sms-code"));
       return;
     }
     clearInvalid(ref("sms-code"));
+    notices.clear("auth-step");
     pendingAuthAction = "verify";
+    pendingAuthAccepted = false;
     void runAuthorizationMutation("auth-sms-verify", (operationId) => api.verifySms(operationId, code));
   });
   app.querySelector("[data-action='auth-cancel']").addEventListener("click", () => { void cancelAuthorizationAttempt(); });
@@ -1420,9 +1487,11 @@ function bindEvents() {
 async function refreshStatus(showFailure = false) {
   if (pollInFlight || document.visibilityState === "hidden") return;
   pollInFlight = true;
+  const revision = authRevision;
   renderBusy();
   try {
     const [authResult, cameraResult] = await Promise.all([api.authStatus(), api.cameraStatus(), refreshRtsp()]);
+    if (revision !== authRevision) return;
     projectAuth(authResult);
     projectCameraStatus(cameraResult);
     notices.clear("status-poll");
@@ -1443,14 +1512,16 @@ async function refreshStatus(showFailure = false) {
     settleAuthorizationFlow();
     settlePendingMediaAction();
     render();
+    // A failed read can leave QUEUED/LOADING cached; catalogPromise owns single-flight.
     if (
       auth.state_code === AuthState.AUTHENTICATED &&
       !authAttemptActive && !pendingClear && !regionInFlight &&
-      !catalogPromise && !catalogLoaded && !CATALOG_ACTIVE_STATES.has(cameraListState)
+      !catalogPromise && !catalogLoaded
     ) void loadCameraList(false).catch(() => {});
     statusErrors.finishHydration();
     initialStatusLoaded = true;
   } catch (error) {
+    if (revision !== authRevision) return;
     if (showFailure || initialStatusLoaded) showError(error, "status-poll");
     else feedback("error", "statusUnavailable", "status-poll", errorSignature(error));
   } finally {
@@ -1468,6 +1539,8 @@ function schedulePoll(delay) {
 Locale.addListener((next) => { language = next.language; applyLocale(); });
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "hidden") {
+    consumeSecret(ref("sms-code"));
+    renderAuthorization();
     rtspCredentialsNeedLoad = true;
     clearRtspCredentials();
     if (pollTimer) window.clearTimeout(pollTimer);

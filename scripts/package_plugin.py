@@ -359,6 +359,10 @@ def collect_source_files():
         "source plugin manifest",
     )
     license_data, _ = read_regular(REPO_ROOT / "LICENSE", "plugin license", 64 * 1024)
+    if (b"GNU GENERAL PUBLIC LICENSE" not in license_data or
+            b"Version 3, 29 June 2007" not in license_data or
+            b"END OF TERMS AND CONDITIONS" not in license_data):
+        raise ValueError("plugin GPL-3.0 license text is invalid")
     files = {Path("plugin.json"): manifest_data, Path("LICENSE"): license_data}
     for tree_name in ("www", "legal"):
         tree = PLUGIN_SOURCE / tree_name
@@ -377,6 +381,55 @@ def collect_source_files():
             raise ValueError("source Web file is missing: %s" % required)
     validate_source_legal(files)
     return manifest, files
+
+
+def validate_go_patches(patches):
+    lock_data, _ = read_regular(PLUGIN_SOURCE / "go2rtc/SOURCE.lock", "go2rtc SOURCE.lock")
+    try:
+        lock_text = lock_data.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("go2rtc SOURCE.lock is not UTF-8: %s" % error)
+    lock = {}
+    for line in lock_text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, separator, value = line.partition("=")
+        if not separator:
+            raise ValueError("go2rtc SOURCE.lock contains an invalid assignment")
+        if key in lock:
+            raise ValueError("go2rtc SOURCE.lock contains a duplicate key: %s" % key)
+        lock[key] = value
+    patch_keys = [
+        key for key in lock
+        if key.startswith("GO2RTC_") and key.endswith("_PATCH")
+    ]
+    digest_keys = {
+        key for key in lock
+        if key.startswith("GO2RTC_") and key.endswith("_PATCH_SHA256")
+    }
+    if digest_keys != {key + "_SHA256" for key in patch_keys}:
+        raise ValueError("go2rtc SOURCE.lock patch names and digests are not paired")
+    expected = [(lock[key], lock[key + "_SHA256"]) for key in patch_keys]
+    if not expected or any(not isinstance(sha, str) or not SHA256_RE.fullmatch(sha)
+                           for _, sha in expected):
+        raise ValueError("go2rtc SOURCE.lock has an invalid patch digest or empty patch list")
+    if len({name for name, _ in expected}) != len(expected):
+        raise ValueError("go2rtc SOURCE.lock contains duplicate patch filenames")
+    patch_dir = PLUGIN_SOURCE / "go2rtc/patches"
+    require_directory(patch_dir, "go2rtc patch directory")
+    for name, sha in expected:
+        data, _ = read_regular(patch_dir / name, "go2rtc source patch %s" % name)
+        if sha256_bytes(data) != sha:
+            raise ValueError("go2rtc source patch SHA-256 does not match SOURCE.lock: %s" % name)
+    if not isinstance(patches, list) or len(patches) != len(expected):
+        raise ValueError("go2rtc build provenance patches must match the complete SOURCE.lock list")
+    for number, (record, (name, sha)) in enumerate(zip(patches, expected), 1):
+        if not isinstance(record, dict) or (record.get("file"), record.get("sha256")) != (name, sha):
+            raise ValueError(
+                "go2rtc build provenance patch #%d does not match SOURCE.lock: %s (name/sha256)"
+                % (number, name)
+            )
 
 
 def validate_go_legal(runtime_files, go2rtc_digest):
@@ -428,6 +481,7 @@ def validate_go_legal(runtime_files, go2rtc_digest):
     for key, expected_value in required_provenance.items():
         if provenance.get(key) != expected_value:
             raise ValueError("go2rtc build provenance has an invalid %s" % key)
+    validate_go_patches(provenance.get("patches"))
     modules = decode_json_object_stream(
         runtime_files[root / "GO-MODULES.json"],
         "go2rtc module graph",
@@ -675,11 +729,17 @@ def ensure_directory(path):
 @contextmanager
 def publication_lock(directory):
     ensure_directory(directory)
+    lock_path = directory / ".mhcamera-publish.lock"
     descriptor = os.open(
-        str(directory),
-        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+        str(lock_path),
+        os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
     )
     try:
+        status = os.fstat(descriptor)
+        if not stat.S_ISREG(status.st_mode) or status.st_nlink != 1:
+            raise ValueError("publication lock is not a private regular file")
+        os.fchmod(descriptor, 0o600)
         fcntl.flock(descriptor, fcntl.LOCK_EX)
         yield
     finally:

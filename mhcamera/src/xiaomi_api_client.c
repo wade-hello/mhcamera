@@ -22,9 +22,16 @@
 #include <time.h>
 #include <unistd.h>
 
+/* A catalog is read from the local sidecar socket, so the response size is the
+ * only bound on catalog memory: without it a streaming peer could exhaust the
+ * device. 1 MiB covers well over three thousand sources; the catalog itself is
+ * deliberately not capped by an assumed device count. */
 #define XC_API_RESPONSE_MAX (1024u * 1024u)
 #define XC_API_JSON_DEPTH_MAX 32u
-#define XC_API_JSON_NODES_MAX 8192u
+/* Bound the structural validation walk. A complete source entry is at least
+ * ten nodes, so the bound admits several thousand sources without turning the
+ * response into an unbounded allocation. */
+#define XC_API_JSON_NODES_MAX (65536u)
 #define XC_PHONE_CODE_LENGTH_MAX 64u
 
 static void xc_secure_clear(void *memory, size_t size)
@@ -500,6 +507,11 @@ static bool xc_decimal_id(const char *value, size_t maximum, bool allow_empty)
     return true;
 }
 
+static bool xc_camera_id_valid(const char *value)
+{
+    return value && value[0] != '\0' && strnlen(value, 65u) <= 64u;
+}
+
 static char *xc_account_label(const char *id)
 {
     size_t length;
@@ -507,9 +519,9 @@ static char *xc_account_label(const char *id)
 
     if (!id || !(length = strlen(id))) return NULL;
     if (length <= 4u) return strdup("****");
-    label = malloc(length + 1u);
+    label = malloc(sizeof("12******89"));
     if (!label) return NULL;
-    snprintf(label, length + 1u, "%.*s******%s", 2, id, id + length - 2u);
+    snprintf(label, sizeof("12******89"), "%.*s******%s", 2, id, id + length - 2u);
     return label;
 }
 
@@ -554,6 +566,91 @@ static int xc_parse_accounts(const cJSON *root, struct xc_xiaomi_response *respo
     return 0;
 }
 
+static void xc_camera_clear(struct xc_xiaomi_camera *camera)
+{
+    if (!camera) return;
+    xc_free_secret(camera->id);
+    xc_free_secret(camera->name);
+    xc_free_secret(camera->model);
+    xc_free_secret(camera->info);
+    xc_free_secret(camera->source);
+    xc_free_secret(camera->home_id);
+    xc_free_secret(camera->home_name);
+    xc_free_secret(camera->room_id);
+    xc_free_secret(camera->room_name);
+    memset(camera, 0, sizeof(*camera));
+}
+
+/* Returns 0 on success, 1 for an absent or non-string field, and -1 when the
+ * allocation failed, so an out-of-memory failure is never downgraded to a
+ * skipped catalog entry by a later format error. */
+static int xc_camera_dup_field(const cJSON *item, const char *key, char **field)
+{
+    *field = xc_dup_json_text(item, key, true);
+    if (*field) return 0;
+    return errno == ENOMEM ? -1 : 1;
+}
+
+static int xc_camera_dup_display_field(const cJSON *item, const char *key,
+                                       char **field)
+{
+    const cJSON *value = cJSON_GetObjectItemCaseSensitive(item, key);
+
+    *field = strdup(cJSON_IsString(value) && value->valuestring ?
+                    value->valuestring : "");
+    return *field ? 0 : -1;
+}
+
+/* One catalog entry is either usable (0), an entry the catalog skips (1), or a
+ * local failure that aborts the response (-1, errno set). The caller owns every
+ * field the parser stored, including the fields of a skipped entry. */
+static int xc_parse_camera_entry(const cJSON *item,
+                                 const char *account_id,
+                                 const char *region,
+                                 struct xc_xiaomi_camera *camera)
+{
+    char source_id[65];
+    char source_model[129];
+
+    if (!cJSON_IsObject(item)) return 1;
+    if (xc_camera_dup_field(item, "url", &camera->source) ||
+        xc_camera_dup_field(item, "id", &camera->id) ||
+        xc_camera_dup_field(item, "model", &camera->model)) {
+        if (errno == ENOMEM) goto fatal;
+        goto skip;
+    }
+    if (xc_camera_dup_display_field(item, "name", &camera->name) ||
+        xc_camera_dup_display_field(item, "info", &camera->info) ||
+        xc_camera_dup_display_field(item, "home_id", &camera->home_id) ||
+        xc_camera_dup_display_field(item, "home_name", &camera->home_name) ||
+        xc_camera_dup_display_field(item, "room_id", &camera->room_id) ||
+        xc_camera_dup_display_field(item, "room_name", &camera->room_name))
+        goto fatal;
+    if (!xc_camera_id_valid(camera->id)) {
+        goto skip;
+    }
+    if (strlen(camera->model) >= 128u) {
+        goto skip;
+    }
+    if (xc_camera_source_identify(camera->source, account_id, region,
+                                  source_id, sizeof(source_id), source_model,
+                                  sizeof(source_model)) != 0) {
+        goto skip;
+    }
+    if (strcmp(source_id, camera->id) != 0) {
+        goto skip;
+    }
+    if (strcmp(source_model, camera->model) != 0) {
+        goto skip;
+    }
+    return 0;
+
+skip:
+    return 1;
+fatal:
+    return -1;
+}
+
 static int xc_parse_cameras(const cJSON *root,
                             const char *account_id,
                             const char *region,
@@ -562,62 +659,92 @@ static int xc_parse_cameras(const cJSON *root,
     const cJSON *response_region = cJSON_GetObjectItemCaseSensitive(root, "region");
     const cJSON *array = cJSON_GetObjectItemCaseSensitive(root, "sources");
     const cJSON *item;
-    size_t count;
-    size_t index = 0u;
+    size_t count = cJSON_IsArray(array) ? (size_t)cJSON_GetArraySize(array) : 0u;
+    size_t capacity = 0u;
+    size_t kept = 0u;
 
-    if (!cJSON_IsObject(root) || !cJSON_IsString(response_region) ||
-        !response_region->valuestring ||
-        strcmp(response_region->valuestring, region) != 0 ||
-        !cJSON_IsArray(array)) {
+    if (!cJSON_IsObject(root)) {
+        errno = EPROTO;
+        return -1;
+    }
+    if (!cJSON_IsString(response_region) || !response_region->valuestring) {
+        errno = EPROTO;
+        return -1;
+    }
+    if (strcmp(response_region->valuestring, region) != 0) {
+        errno = EPROTO;
+        return -1;
+    }
+    if (!cJSON_IsArray(array)) {
         errno = EPROTO;
         return -1;
     }
     snprintf(response->catalog_region, sizeof(response->catalog_region), "%s", region);
-    count = (size_t)cJSON_GetArraySize(array);
-    if (count > 256u) {
-        errno = EOVERFLOW;
+    if (count == 0u) return 0;
+    cJSON_ArrayForEach(item, array) {
+        struct xc_xiaomi_camera candidate = {0};
+        int result = xc_parse_camera_entry(item, account_id, region,
+                                           &candidate);
+
+        if (result > 0) {
+            xc_camera_clear(&candidate);
+            continue;
+        }
+        if (result < 0) {
+            int saved = errno;
+
+            xc_camera_clear(&candidate);
+            errno = saved;
+            goto fail;
+        }
+        if (kept == capacity) {
+            size_t grown = capacity ? capacity * 2u : 8u;
+            struct xc_xiaomi_camera *enlarged;
+
+            if (grown > count) grown = count;
+            enlarged = realloc(response->cameras, grown * sizeof(*enlarged));
+            if (!enlarged) {
+                int saved = errno ? errno : ENOMEM;
+
+                xc_camera_clear(&candidate);
+                errno = saved;
+                goto fail;
+            }
+            response->cameras = enlarged;
+            capacity = grown;
+        }
+        {
+            size_t existing;
+            bool duplicate = false;
+
+            /* The DID is the device identity: a page boundary that shifts while
+             * the account is edited can list the same camera twice, and that is
+             * one camera, not two. Keep the first record and drop the repeat. */
+            for (existing = 0u; existing < kept; ++existing) {
+                if (strcmp(response->cameras[existing].id, candidate.id) == 0) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) {
+                xc_camera_clear(&candidate);
+                continue;
+            }
+        }
+        response->cameras[kept++] = candidate;
+    }
+    response->camera_count = kept;
+    if (kept == 0u) {
+        /* A catalog with entries but no usable camera is not the honest
+         * "no cameras" answer an empty sources array represents. */
+        errno = EPROTO;
         return -1;
     }
-    if (count == 0u) return 0;
-    response->cameras = calloc(count, sizeof(*response->cameras));
-    if (!response->cameras) return -1;
-    response->camera_count = count;
-    cJSON_ArrayForEach(item, array) {
-        struct xc_xiaomi_camera *camera = &response->cameras[index++];
-        char source_id[65];
-        char source_model[129];
-
-        if (!cJSON_IsObject(item)) {
-            errno = EPROTO;
-            return -1;
-        }
-        camera->source = xc_dup_json_text(item, "url", true);
-        camera->id = xc_dup_json_text(item, "id", true);
-        camera->name = xc_dup_json_text(item, "name", true);
-        camera->model = xc_dup_json_text(item, "model", true);
-        camera->info = xc_dup_json_text(item, "info", true);
-        camera->home_id = xc_dup_json_text(item, "home_id", true);
-        camera->home_name = xc_dup_json_text(item, "home_name", true);
-        camera->room_id = xc_dup_json_text(item, "room_id", true);
-        camera->room_name = xc_dup_json_text(item, "room_name", true);
-        if (!camera->id || !camera->name || !camera->model || !camera->info ||
-            !camera->source || !camera->home_id || !camera->home_name ||
-            !camera->room_id || !camera->room_name ||
-            !xc_decimal_id(camera->id, 64u, false) ||
-            !xc_decimal_id(camera->home_id, 64u, true) ||
-            !xc_decimal_id(camera->room_id, 64u, true) ||
-            strlen(camera->name) >= 128u || strlen(camera->model) >= 128u ||
-            strlen(camera->home_name) >= 128u || strlen(camera->room_name) >= 128u ||
-            xc_camera_source_identify(camera->source, account_id, region,
-                                      source_id, sizeof(source_id), source_model,
-                                      sizeof(source_model)) != 0 ||
-            strcmp(source_id, camera->id) != 0 ||
-            strcmp(source_model, camera->model) != 0) {
-            errno = EPROTO;
-            return -1;
-        }
-    }
     return 0;
+
+fail:
+    response->camera_count = kept;
+    return -1;
 }
 
 static bool xc_object_only_keys(const cJSON *object,
@@ -688,6 +815,10 @@ static int xc_parse_phone_response(const cJSON *root,
     static const char *const sms_keys[] = {
         "state", "masked_target", "code_length", "retry_after_seconds"
     };
+    static const char *const sms_error_keys[] = {
+        "state", "masked_target", "code_length", "retry_after_seconds",
+        "error", "provider_code"
+    };
     static const char *const state_only_keys[] = {"state"};
     static const char *const error_keys[] = {"state", "error", "provider_code"};
     const cJSON *state;
@@ -697,8 +828,13 @@ static int xc_parse_phone_response(const cJSON *root,
         !(state = cJSON_GetObjectItemCaseSensitive(root, "state")) ||
         !cJSON_IsString(state) || !state->valuestring) goto invalid;
     if (strcmp(state->valuestring, "sms_required") == 0) {
+        const cJSON *phone_error = cJSON_GetObjectItemCaseSensitive(root, "error");
+
         item = cJSON_GetObjectItemCaseSensitive(root, "masked_target");
-        if (!xc_object_only_keys(root, sms_keys, sizeof(sms_keys) / sizeof(sms_keys[0])) ||
+        if (!xc_object_only_keys(root,
+                phone_error ? sms_error_keys : sms_keys,
+                phone_error ? sizeof(sms_error_keys) / sizeof(sms_error_keys[0]) :
+                              sizeof(sms_keys) / sizeof(sms_keys[0])) ||
             !cJSON_IsString(item) || !item->valuestring || !item->valuestring[0] ||
             strlen(item->valuestring) >= sizeof(response->phone_masked_target) ||
             !xc_json_positive_uint(cJSON_GetObjectItemCaseSensitive(root, "code_length"),
@@ -712,7 +848,7 @@ static int xc_parse_phone_response(const cJSON *root,
                  "sms_required");
         snprintf(response->phone_masked_target, sizeof(response->phone_masked_target),
                  "%s", item->valuestring);
-        return 0;
+        if (!phone_error) return 0;
     }
     if (strcmp(state->valuestring, "authenticated") == 0) {
         if (!xc_object_only_keys(root, state_only_keys,
@@ -731,13 +867,15 @@ static int xc_parse_phone_response(const cJSON *root,
         snprintf(response->phone_state, sizeof(response->phone_state), "%s", "idle");
         return 0;
     }
-    if (strcmp(state->valuestring, "error") == 0) {
+    if (strcmp(state->valuestring, "error") == 0 ||
+        strcmp(state->valuestring, "sms_required") == 0) {
         const cJSON *provider_code =
             cJSON_GetObjectItemCaseSensitive(root, "provider_code");
 
         item = cJSON_GetObjectItemCaseSensitive(root, "error");
-        if (!xc_object_only_keys(root, error_keys,
-                                 sizeof(error_keys) / sizeof(error_keys[0])) ||
+        if ((strcmp(state->valuestring, "error") == 0 &&
+             !xc_object_only_keys(root, error_keys,
+                                  sizeof(error_keys) / sizeof(error_keys[0]))) ||
             !cJSON_IsString(item) || !item->valuestring ||
             !xc_phone_error_valid(item->valuestring) ||
             strlen(item->valuestring) >= sizeof(response->phone_error) ||
@@ -746,7 +884,8 @@ static int xc_parse_phone_response(const cJSON *root,
               provider_code->valuedouble > (double)INT_MAX ||
               provider_code->valuedouble != (double)provider_code->valueint)))
             goto invalid;
-        snprintf(response->phone_state, sizeof(response->phone_state), "%s", "error");
+        if (strcmp(state->valuestring, "error") == 0)
+            snprintf(response->phone_state, sizeof(response->phone_state), "%s", "error");
         snprintf(response->phone_error, sizeof(response->phone_error), "%s",
                  item->valuestring);
         if (provider_code) {
@@ -1150,17 +1289,8 @@ void xc_xiaomi_response_clear(struct xc_xiaomi_response *response)
         }
     free(response->accounts);
     if (response->cameras)
-        for (index = 0u; index < response->camera_count; ++index) {
-            xc_free_secret(response->cameras[index].id);
-            xc_free_secret(response->cameras[index].name);
-            xc_free_secret(response->cameras[index].model);
-            xc_free_secret(response->cameras[index].info);
-            xc_free_secret(response->cameras[index].source);
-            xc_free_secret(response->cameras[index].home_id);
-            xc_free_secret(response->cameras[index].home_name);
-            xc_free_secret(response->cameras[index].room_id);
-            xc_free_secret(response->cameras[index].room_name);
-        }
+        for (index = 0u; index < response->camera_count; ++index)
+            xc_camera_clear(&response->cameras[index]);
     free(response->cameras);
     xc_secure_clear(response, sizeof(*response));
 }

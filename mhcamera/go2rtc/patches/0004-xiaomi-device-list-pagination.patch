@@ -1,5 +1,5 @@
 diff --git a/internal/xiaomi/xiaomi.go b/internal/xiaomi/xiaomi.go
-index 41a1622d19192d590aee6e1ef6ee6bdfc90d701f..87b4083232c25563d2d12e5c228a425d0108c9ea 100644
+index 41a1622..2b9eac2 100644
 --- a/internal/xiaomi/xiaomi.go
 +++ b/internal/xiaomi/xiaomi.go
 @@ -1,6 +1,7 @@
@@ -79,7 +79,7 @@ index 41a1622d19192d590aee6e1ef6ee6bdfc90d701f..87b4083232c25563d2d12e5c228a425d
  		return nil
  	}()
  
-@@ -278,12 +282,199 @@ func apiDeviceList(w http.ResponseWriter, r *http.Request) {
+@@ -278,12 +282,222 @@ func apiDeviceList(w http.ResponseWriter, r *http.Request) {
  	}
  }
  
@@ -129,36 +129,36 @@ index 41a1622d19192d590aee6e1ef6ee6bdfc90d701f..87b4083232c25563d2d12e5c228a425d
 +			return nil, fmt.Errorf("%w: device page", errCatalogIncomplete)
 +		}
 +
-+		var pageDevices []*Device
++		var pageDevices []json.RawMessage
 +		if string(page.List) == "null" {
 +			if page.HasMore {
 +				return nil, fmt.Errorf("%w: non-terminal null device list", errCatalogIncomplete)
 +			}
-+			pageDevices = make([]*Device, 0)
++			pageDevices = make([]json.RawMessage, 0)
 +		} else if err = json.Unmarshal(page.List, &pageDevices); err != nil || pageDevices == nil {
 +			return nil, fmt.Errorf("%w: device list", errCatalogIncomplete)
 +		}
-+
-+		for _, device := range pageDevices {
-+			if device == nil || device.Did == "" {
-+				return nil, fmt.Errorf("%w: device", errCatalogIncomplete)
-+			}
-+			if !isCameraModel(device.Model) {
++		for _, entry := range pageDevices {
++			device, camera := decodeCameraDevice(entry)
++			if !camera {
 +				continue
 +			}
-+			if !isDecimalID(string(device.Did)) {
-+				return nil, fmt.Errorf("%w: camera id", errCatalogIncomplete)
++			if device == nil {
++				continue
 +			}
 +			deviceOwnerID, parseErr := parseOwnerID(device.UID)
 +			if parseErr != nil {
-+				return nil, fmt.Errorf("%w: camera owner", errCatalogIncomplete)
++				continue
++			}
++			if deviceOwnerID == "" {
++				continue
 +			}
 +			if deviceOwnerID != ownerID {
 +				continue
 +			}
 +			if previous := byDID[device.Did]; previous != nil {
-+				if !sameDevice(previous, device) {
-+					return nil, fmt.Errorf("%w: conflicting device", errCatalogIncomplete)
++				if !usableSourceHost(previous.IP) && usableSourceHost(device.IP) {
++					*previous = *device
 +				}
 +				continue
 +			}
@@ -179,6 +179,32 @@ index 41a1622d19192d590aee6e1ef6ee6bdfc90d701f..87b4083232c25563d2d12e5c228a425d
 +		seenCursors[next] = struct{}{}
 +		cursor = next
 +	}
++}
++
++// Decode the model before typed fields: unrelated or malformed entries must
++// not make an otherwise complete device page unusable.
++func decodeCameraDevice(entry json.RawMessage) (*Device, bool) {
++	var identity struct {
++		Model string `json:"model"`
++	}
++	if err := json.Unmarshal(entry, &identity); err != nil || !isCameraModel(identity.Model) {
++		return nil, false
++	}
++	var fields struct {
++		Did  xiaomiValue     `json:"did"`
++		UID  json.RawMessage `json:"uid"`
++		Name json.RawMessage `json:"name"`
++		MAC  json.RawMessage `json:"mac"`
++		IP   json.RawMessage `json:"localip"`
++	}
++	if err := json.Unmarshal(entry, &fields); err != nil || fields.Did == "" {
++		return nil, true
++	}
++	device := &Device{Did: fields.Did, UID: fields.UID, Model: identity.Model}
++	_ = json.Unmarshal(fields.Name, &device.Name)
++	_ = json.Unmarshal(fields.MAC, &device.MAC)
++	_ = json.Unmarshal(fields.IP, &device.IP)
++	return device, true
 +}
 +
 +func parseOwnerID(data json.RawMessage) (xiaomiValue, error) {
@@ -221,10 +247,6 @@ index 41a1622d19192d590aee6e1ef6ee6bdfc90d701f..87b4083232c25563d2d12e5c228a425d
 +	return false
 +}
 +
-+func sameDevice(a, b *Device) bool {
-+	return a.Did == b.Did && a.Name == b.Name && a.Model == b.Model && a.MAC == b.MAC && a.IP == b.IP
-+}
-+
 +type xiaomiValue string
 +
 +func (id *xiaomiValue) UnmarshalJSON(data []byte) error {
@@ -246,12 +268,13 @@ index 41a1622d19192d590aee6e1ef6ee6bdfc90d701f..87b4083232c25563d2d12e5c228a425d
 +			return "", errCatalogIncomplete
 +		}
 +	} else {
-+		value = string(data)
++		var number json.Number
++		if err := json.Unmarshal(data, &number); err != nil {
++			return "", errCatalogIncomplete
++		}
++		value = number.String()
 +	}
 +	if value == "" {
-+		return "", errCatalogIncomplete
-+	}
-+	if data[0] != '"' && !isDecimalID(value) {
 +		return "", errCatalogIncomplete
 +	}
 +	return xiaomiValue(value), nil
@@ -285,7 +308,7 @@ index 41a1622d19192d590aee6e1ef6ee6bdfc90d701f..87b4083232c25563d2d12e5c228a425d
  
  var auth *xiaomi.Cloud
 diff --git a/pkg/xiaomi/cloud.go b/pkg/xiaomi/cloud.go
-index 0dcfd241417a9a756e282f555acd842bbe17f75f..f97c87124699386e10c6b8b71367332c70c92a70 100644
+index 0dcfd24..f97c871 100644
 --- a/pkg/xiaomi/cloud.go
 +++ b/pkg/xiaomi/cloud.go
 @@ -2,6 +2,7 @@ package xiaomi

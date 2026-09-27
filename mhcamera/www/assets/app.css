@@ -224,6 +224,8 @@ label {
 
 .panel-heading-switch { padding-right: 56px; }
 .panel-heading-switch .rtsp-switch { position: absolute; top: -12px; right: 0; }
+.auth-panel .subtitle { text-wrap: pretty; }
+.auth-panel [data-ref="account-label"] { overflow-wrap: anywhere; white-space: normal; overflow: visible; }
 .rtsp-address-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 7px; color: var(--ui-muted); font-size: 12px; }
 .rtsp-address-actions { display: flex; flex: 0 0 auto; gap: 4px; }
 

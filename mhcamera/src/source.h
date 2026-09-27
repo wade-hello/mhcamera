@@ -62,6 +62,11 @@ int xc_camera_source_identify(const char *core_source,
                               size_t camera_id_size,
                               char *model,
                               size_t model_size);
+/* Reads the audio query parameter of a rebuilt product source, so callers
+ * never depend on the parameter order or on a trailing separator. Returns
+ * false for anything that is not a rebuilt product source with a valid audio
+ * parameter, so unreadable state is never reported as audio enabled. */
+bool xc_camera_source_audio_enabled(const char *source);
 
 #ifdef __cplusplus
 }

@@ -16,7 +16,6 @@
 #include <limits.h>
 #include <pthread.h>
 #include <signal.h>
-#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,6 +24,11 @@
 #include <unistd.h>
 
 struct xc_app {
+    /* Monitors hold child_lock across the reset check and WNOHANG poll.
+     * While sidecar_resetting is true, only the reset worker may access child,
+     * child_started and child_failed, including its synchronous ready callback.
+     * Startup precedes workers; shutdown accesses them only after workers join. */
+    pthread_mutex_t child_lock;
     struct xc_process child;
     struct xc_xiaomi_api_client api;
     struct xc_media_owner *media;
@@ -39,7 +43,7 @@ struct xc_app {
     char media_socket_path[108];
     bool child_started;
     bool child_failed;
-    atomic_bool sidecar_resetting;
+    bool sidecar_resetting;
     pthread_t event_thread;
     bool event_thread_started;
 };
@@ -127,6 +131,7 @@ static int xc_sidecar_start(struct xc_app *app)
 {
     char *argv[] = {app->executable, "-config", app->config_path, NULL};
 
+    /* The initial caller or reset worker exclusively owns the child here. */
     if (xc_process_start(&app->child, app->executable, argv,
                          app->api_socket_path, 10000u) != 0)
         return -1;
@@ -151,7 +156,16 @@ static int xc_sidecar_reset_adapter(void *userdata, bool clear_token)
     struct xc_app *app = userdata;
     int result = -1;
 
-    atomic_store_explicit(&app->sidecar_resetting, true, memory_order_release);
+    pthread_mutex_lock(&app->child_lock);
+    if (app->sidecar_resetting) {
+        pthread_mutex_unlock(&app->child_lock);
+        errno = EBUSY;
+        return -1;
+    }
+    app->sidecar_resetting = true;
+    pthread_mutex_unlock(&app->child_lock);
+    /* No monitor can touch the child until publication below. Keep blocking
+     * stop/start, readiness callbacks and media joins outside child_lock. */
     xc_media_owner_stop(app->media);
     if (app->child_started && !app->child.exited &&
         xc_process_stop(&app->child, 5000u) != 0)
@@ -162,7 +176,9 @@ static int xc_sidecar_reset_adapter(void *userdata, bool clear_token)
         goto done;
     result = xc_sidecar_start(app);
 done:
-    atomic_store_explicit(&app->sidecar_resetting, false, memory_order_release);
+    pthread_mutex_lock(&app->child_lock);
+    app->sidecar_resetting = false;
+    pthread_mutex_unlock(&app->child_lock);
     return result;
 }
 
@@ -275,19 +291,19 @@ static int xc_should_stop(void *userdata)
 {
     struct xc_app *app = userdata;
     bool exited = false;
+    int stop = 0;
 
     if (xc_stopping) return 1;
-    if (atomic_load_explicit(&app->sidecar_resetting, memory_order_acquire)) return 0;
-    if (app->child_started && xc_process_poll(&app->child, &exited, NULL) != 0) {
+    pthread_mutex_lock(&app->child_lock);
+    if (!app->sidecar_resetting && app->child_started &&
+        (xc_process_poll(&app->child, &exited, NULL) != 0 || exited)) {
         app->child_failed = true;
-        return 1;
+        stop = 1;
     }
-    if (exited) {
-        app->child_failed = true;
+    pthread_mutex_unlock(&app->child_lock);
+    if (exited)
         fprintf(stderr, "mhcamera: event=go2rtc_exit result=unexpected\n");
-        return 1;
-    }
-    return 0;
+    return stop;
 }
 
 static int xc_event_should_stop(void *userdata)
@@ -328,6 +344,7 @@ static int xc_ready_abort(void *userdata)
     struct xc_app *app = userdata;
     bool exited = false;
 
+    /* Synchronous callback of the exclusive startup/reset owner. */
     if (xc_stopping) return 1;
     if (xc_process_poll(&app->child, &exited, NULL) != 0) return -1;
     if (exited) {
@@ -353,15 +370,13 @@ int main(void)
 {
     const char *plugin_dir = getenv("AINICE_PLUGIN_DIR");
     const char *data_dir = getenv("AINICE_PLUGIN_DATA");
-    struct xc_app app;
+    struct xc_app app = {.child_lock = PTHREAD_MUTEX_INITIALIZER};
     struct xc_service_ops service_ops;
     struct xc_rtsp_ops rtsp_ops;
     struct xc_saved_selection saved_selection;
     int bridge_result = -1;
     int stop_result = 0;
 
-    memset(&app, 0, sizeof(app));
-    atomic_init(&app.sidecar_resetting, false);
     if (geteuid() == 0 || !plugin_dir || !data_dir || plugin_dir[0] != '/' ||
         data_dir[0] != '/' || strcmp(plugin_dir, "/") == 0 ||
         strcmp(data_dir, XC_DATA_DIRECTORY) != 0 || xc_install_signals() != 0) {
@@ -455,6 +470,7 @@ shutdown:
     xc_stopping = 1;
     if (app.event_thread_started) pthread_join(app.event_thread, NULL);
     xc_service_stop(app.service);
+    /* Event monitor and service/reset worker are joined; main owns child. */
     if (app.child_started && !app.child.exited)
         (void)xc_rtsp_source(app.rtsp, false);
     xc_media_owner_stop(app.media);
@@ -465,5 +481,6 @@ shutdown:
     xc_service_destroy(app.service);
     xc_media_owner_destroy(app.media);
     xc_rtsp_destroy(app.rtsp);
+    pthread_mutex_destroy(&app.child_lock);
     return bridge_result == 0 && !app.child_failed && stop_result == 0 ? 0 : 1;
 }

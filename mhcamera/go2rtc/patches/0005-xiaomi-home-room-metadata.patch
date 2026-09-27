@@ -1,8 +1,16 @@
 diff --git a/internal/xiaomi/xiaomi.go b/internal/xiaomi/xiaomi.go
-index ba04461271cdd3d0a289edbbd74d0dc7c6995a5a..7744e4fd625c488140656c2d7a3318e15bf6c242 100644
+index 2b9eac2..10ca6fa 100644
 --- a/internal/xiaomi/xiaomi.go
 +++ b/internal/xiaomi/xiaomi.go
-@@ -82,11 +82,19 @@ func cloudRequest(userID, region, apiURL, params string) ([]byte, error) {
+@@ -7,6 +7,7 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"net/http"
++	"net/netip"
+ 	"net/url"
+ 	"strings"
+ 	"sync"
+@@ -82,11 +83,19 @@ func cloudRequest(userID, region, apiURL, params string) ([]byte, error) {
  }
  
  func cloudRequestContext(ctx context.Context, userID, region, apiURL, params string) ([]byte, error) {
@@ -23,7 +31,7 @@ index ba04461271cdd3d0a289edbbd74d0dc7c6995a5a..7744e4fd625c488140656c2d7a3318e1
  }
  
  func cloudUserRequest(user *url.Userinfo, apiURL, params string) ([]byte, error) {
-@@ -233,10 +241,13 @@ func apiXiaomi(w http.ResponseWriter, r *http.Request) {
+@@ -233,10 +242,13 @@ func apiXiaomi(w http.ResponseWriter, r *http.Request) {
  }
  
  func apiDeviceList(w http.ResponseWriter, r *http.Request) {
@@ -40,7 +48,7 @@ index ba04461271cdd3d0a289edbbd74d0dc7c6995a5a..7744e4fd625c488140656c2d7a3318e1
  		cloudsMu.Lock()
  		users := make([]string, 0, len(tokens))
  		for s := range tokens {
-@@ -247,33 +258,32 @@ func apiDeviceList(w http.ResponseWriter, r *http.Request) {
+@@ -247,33 +259,32 @@ func apiDeviceList(w http.ResponseWriter, r *http.Request) {
  		api.ResponseJSON(w, users)
  		return
  	}
@@ -93,7 +101,7 @@ index ba04461271cdd3d0a289edbbd74d0dc7c6995a5a..7744e4fd625c488140656c2d7a3318e1
  		return nil
  	}()
  
-@@ -285,9 +295,307 @@ func apiDeviceList(w http.ResponseWriter, r *http.Request) {
+@@ -285,9 +296,310 @@ func apiDeviceList(w http.ResponseWriter, r *http.Request) {
  const catalogRequestTimeout = 45 * time.Second
  
  var errCatalogIncomplete = errors.New("xiaomi: catalog incomplete")
@@ -148,20 +156,6 @@ index ba04461271cdd3d0a289edbbd74d0dc7c6995a5a..7744e4fd625c488140656c2d7a3318e1
 +	roomName string
 +}
 +
-+type Home struct {
-+	ID       xiaomiValue     `json:"id"`
-+	UID      json.RawMessage `json:"uid"`
-+	Name     string          `json:"name"`
-+	DIDs     []xiaomiValue   `json:"dids"`
-+	RoomList []*Room         `json:"roomlist"`
-+}
-+
-+type Room struct {
-+	ID   xiaomiValue   `json:"id"`
-+	Name string        `json:"name"`
-+	DIDs []xiaomiValue `json:"dids"`
-+}
-+
 +type homeRecord struct {
 +	name  string
 +	rooms map[xiaomiValue]string
@@ -199,6 +193,9 @@ index ba04461271cdd3d0a289edbbd74d0dc7c6995a5a..7744e4fd625c488140656c2d7a3318e1
 +
 +	sources := make([]*catalogSource, 0, len(devices))
 +	for _, device := range devices {
++		if !usableSourceHost(device.IP) {
++			continue
++		}
 +		location := locations[device.Did]
 +		sourceURL := &url.URL{
 +			Scheme: "xiaomi",
@@ -224,6 +221,20 @@ index ba04461271cdd3d0a289edbbd74d0dc7c6995a5a..7744e4fd625c488140656c2d7a3318e1
 +	return &catalogSnapshot{Region: region, Sources: sources}, nil
 +}
 +
++// The plugin dials xiaomi://<user>:<region>@<host> and rejects anything that is
++// not a usable IPv4 address, so a cloud entry without one (offline or sleeping
++// devices report no localip) cannot become a selectable source. Keep it out of
++// the catalog instead of handing the plugin an entry it must discard.
++func usableSourceHost(host string) bool {
++	addr, err := netip.ParseAddr(host)
++	if err != nil || !addr.Is4() {
++		return false
++	}
++	value := addr.As4()
++	address := uint32(value[0])<<24 | uint32(value[1])<<16 | uint32(value[2])<<8 | uint32(value[3])
++	return address != 0 && address != 0xffffffff && value[0] != 127 && value[0] < 224
++}
++
 +func loadHomeRoomPages(ctx context.Context, userID string, request catalogRequestFunc) (map[xiaomiValue]deviceLocation, error) {
 +	if ctx == nil || !isDecimalID(userID) || request == nil {
 +		return nil, errCatalogIncomplete
@@ -233,33 +244,21 @@ index ba04461271cdd3d0a289edbbd74d0dc7c6995a5a..7744e4fd625c488140656c2d7a3318e1
 +		return nil, err
 +	}
 +	var first struct {
-+		HomeList         []*Home         `json:"homelist"`
++		HomeList         json.RawMessage `json:"homelist"`
 +		ShareHomeListRaw json.RawMessage `json:"share_home_list"`
 +		HasMore          bool            `json:"has_more"`
 +		MaxID            json.RawMessage `json:"max_id"`
 +	}
-+	if err = json.Unmarshal(body, &first); err != nil || first.HomeList == nil {
++	if err = json.Unmarshal(body, &first); err != nil {
 +		return nil, fmt.Errorf("%w: home page", errCatalogIncomplete)
-+	}
-+	shareHomeList := make([]*Home, 0)
-+	if len(first.ShareHomeListRaw) == 0 {
-+		if first.HasMore {
-+			return nil, fmt.Errorf("%w: home page", errCatalogIncomplete)
-+		}
-+	} else if err = json.Unmarshal(first.ShareHomeListRaw, &shareHomeList); err != nil || shareHomeList == nil {
-+		return nil, fmt.Errorf("%w: shared home list", errCatalogIncomplete)
 +	}
 +	builder := &locationBuilder{
 +		ownerID:   xiaomiValue(userID),
 +		homes:     make(map[xiaomiValue]*homeRecord),
 +		locations: make(map[xiaomiValue]deviceLocation),
 +	}
-+	if err = builder.addHomes(first.HomeList); err != nil {
-+		return nil, err
-+	}
-+	if err = builder.addHomes(shareHomeList); err != nil {
-+		return nil, err
-+	}
++	builder.addHomes(catalogRawList(first.HomeList), false)
++	builder.addHomes(catalogRawList(first.ShareHomeListRaw), false)
 +	if !first.HasMore {
 +		return builder.snapshot(), nil
 +	}
@@ -285,16 +284,14 @@ index ba04461271cdd3d0a289edbbd74d0dc7c6995a5a..7744e4fd625c488140656c2d7a3318e1
 +			return nil, err
 +		}
 +		var page struct {
-+			Info    []*Home         `json:"info"`
++			Info    json.RawMessage `json:"info"`
 +			HasMore bool            `json:"has_more"`
 +			MaxID   json.RawMessage `json:"max_id"`
 +		}
-+		if err = json.Unmarshal(body, &page); err != nil || page.Info == nil {
++		if err = json.Unmarshal(body, &page); err != nil {
 +			return nil, fmt.Errorf("%w: home room page", errCatalogIncomplete)
 +		}
-+		if err = builder.addHomes(page.Info); err != nil {
-+			return nil, err
-+		}
++		builder.addHomes(catalogRawList(page.Info), true)
 +		if !page.HasMore {
 +			return builder.snapshot(), nil
 +		}
@@ -310,80 +307,94 @@ index ba04461271cdd3d0a289edbbd74d0dc7c6995a5a..7744e4fd625c488140656c2d7a3318e1
 +	}
 +}
 +
-+func (b *locationBuilder) addHomes(homes []*Home) error {
-+	for _, home := range homes {
-+		if home == nil {
-+			return fmt.Errorf("%w: home", errCatalogIncomplete)
-+		}
-+		ownerID, err := parseOwnerID(home.UID)
-+		if err != nil {
-+			return fmt.Errorf("%w: home owner", errCatalogIncomplete)
-+		}
-+		if ownerID != b.ownerID {
-+			continue
-+		}
-+		if !isDecimalID(string(home.ID)) {
-+			return fmt.Errorf("%w: home", errCatalogIncomplete)
-+		}
-+		record := b.homes[home.ID]
-+		if record == nil {
-+			record = &homeRecord{name: home.Name, rooms: make(map[xiaomiValue]string)}
-+			b.homes[home.ID] = record
-+		} else if home.Name != "" && record.name != "" && home.Name != record.name {
-+			return fmt.Errorf("%w: conflicting home", errCatalogIncomplete)
-+		} else if record.name == "" {
-+			record.name = home.Name
-+		}
-+
-+		for _, room := range home.RoomList {
-+			if room == nil || !isDecimalID(string(room.ID)) {
-+				return fmt.Errorf("%w: room", errCatalogIncomplete)
-+			}
-+			previous, exists := record.rooms[room.ID]
-+			if exists && previous != "" && room.Name != "" && previous != room.Name {
-+				return fmt.Errorf("%w: conflicting room", errCatalogIncomplete)
-+			}
-+			if !exists || previous == "" {
-+				record.rooms[room.ID] = room.Name
-+			}
-+		}
-+
-+		for _, did := range home.DIDs {
-+			if err := b.addLocation(did, deviceLocation{homeID: home.ID, homeName: record.name}); err != nil {
-+				return err
-+			}
-+		}
-+		for _, room := range home.RoomList {
-+			for _, did := range room.DIDs {
-+				if err := b.addLocation(did, deviceLocation{
-+					homeID: home.ID, homeName: record.name,
-+					roomID: room.ID, roomName: record.rooms[room.ID],
-+				}); err != nil {
-+					return err
-+				}
-+			}
-+		}
-+	}
-+	return nil
++func catalogRawList(raw json.RawMessage) []json.RawMessage {
++	var entries []json.RawMessage
++	// Home and room metadata is optional. A missing, null, or malformed
++	// collection must not erase the valid entries in another collection.
++	_ = json.Unmarshal(raw, &entries)
++	return entries
 +}
 +
-+func (b *locationBuilder) addLocation(did xiaomiValue, location deviceLocation) error {
++func catalogValue(raw json.RawMessage) xiaomiValue {
++	value, err := parseXiaomiValue(raw)
++	if err != nil {
++		return ""
++	}
++	return value
++}
++
++func catalogName(raw json.RawMessage) string {
++	var name string
++	_ = json.Unmarshal(raw, &name)
++	return name
++}
++
++func catalogDIDs(raw json.RawMessage) []xiaomiValue {
++	entries := catalogRawList(raw)
++	dids := make([]xiaomiValue, 0, len(entries))
++	for _, entry := range entries {
++		if did := catalogValue(entry); did != "" {
++			dids = append(dids, did)
++		}
++	}
++	return dids
++}
++
++func (b *locationBuilder) addHomes(homes []json.RawMessage, allowOwnerlessKnownHomes bool) {
++	for _, raw := range homes {
++		var fields map[string]json.RawMessage
++		if json.Unmarshal(raw, &fields) != nil || fields == nil {
++			continue
++		}
++		ownerID, err := parseOwnerID(fields["uid"])
++		homeID := catalogValue(fields["id"])
++		ownerMatches := err == nil && ownerID == b.ownerID
++		// Follow-up pages can omit uid; accept only a home established by
++		// an earlier owner-verified entry, never an unknown or foreign home.
++		trustedKnownHome := err == nil && ownerID == "" && allowOwnerlessKnownHomes && homeID != "" && b.homes[homeID] != nil
++		if !ownerMatches && !trustedKnownHome {
++			continue
++		}
++		if homeID == "" {
++			continue
++		}
++		record := b.homes[homeID]
++		if record == nil {
++			record = &homeRecord{name: catalogName(fields["name"]), rooms: make(map[xiaomiValue]string)}
++			b.homes[homeID] = record
++		} else if record.name == "" {
++			record.name = catalogName(fields["name"])
++		}
++		for _, did := range catalogDIDs(fields["dids"]) {
++			b.addLocation(did, deviceLocation{homeID: homeID, homeName: record.name})
++		}
++		for _, roomRaw := range catalogRawList(fields["roomlist"]) {
++			var room map[string]json.RawMessage
++			if json.Unmarshal(roomRaw, &room) != nil || room == nil {
++				continue
++			}
++			roomID := catalogValue(room["id"])
++			if roomID == "" {
++				continue
++			}
++			if record.rooms[roomID] == "" {
++				record.rooms[roomID] = catalogName(room["name"])
++			}
++			for _, did := range catalogDIDs(room["dids"]) {
++				b.addLocation(did, deviceLocation{
++					homeID: homeID, homeName: record.name,
++					roomID: roomID, roomName: record.rooms[roomID],
++				})
++			}
++		}
++	}
++}
++
++func (b *locationBuilder) addLocation(did xiaomiValue, location deviceLocation) {
 +	previous, exists := b.locations[did]
-+	if !exists {
++	if !exists || (previous.homeID == location.homeID && previous.roomID == "" && location.roomID != "") {
 +		b.locations[did] = location
-+		return nil
 +	}
-+	if previous.homeID != location.homeID {
-+		return fmt.Errorf("%w: conflicting device home", errCatalogIncomplete)
-+	}
-+	if previous.roomID == "" && location.roomID != "" {
-+		b.locations[did] = location
-+		return nil
-+	}
-+	if location.roomID == "" || previous.roomID == location.roomID {
-+		return nil
-+	}
-+	return fmt.Errorf("%w: conflicting device room", errCatalogIncomplete)
 +}
 +
 +func (b *locationBuilder) snapshot() map[xiaomiValue]deviceLocation {
@@ -401,7 +412,7 @@ index ba04461271cdd3d0a289edbbd74d0dc7c6995a5a..7744e4fd625c488140656c2d7a3318e1
  func loadDevicePages(ctx context.Context, userID string, request catalogRequestFunc) ([]*Device, error) {
  	if ctx == nil || !isDecimalID(userID) || request == nil {
  		return nil, errCatalogIncomplete
-@@ -513,10 +821,13 @@ func apiAuth(w http.ResponseWriter, r *http.Request) {
+@@ -558,10 +870,13 @@ func apiAuth(w http.ResponseWriter, r *http.Request) {
  
  const AppXiaomiHome = "xiaomiio"
  

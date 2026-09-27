@@ -2,7 +2,7 @@ diff --git a/internal/xiaomi/phone_bootstrap.go b/internal/xiaomi/phone_bootstra
 index e69de29..127c9de 100644
 --- a/internal/xiaomi/phone_bootstrap.go
 +++ b/internal/xiaomi/phone_bootstrap.go
-@@ -0,0 +1,864 @@
+@@ -0,0 +1,902 @@
 +package xiaomi
 +
 +import (
@@ -97,7 +97,7 @@ index e69de29..127c9de 100644
 +	State             string `json:"state"`
 +	MaskedTarget      string `json:"masked_target,omitempty"`
 +	CodeLength        int    `json:"code_length,omitempty"`
-+	RetryAfterSeconds int    `json:"retry_after_seconds,omitempty"`
++	RetryAfterSeconds *int   `json:"retry_after_seconds,omitempty"`
 +	Error             string `json:"error,omitempty"`
 +	ProviderCode      int    `json:"provider_code,omitempty"`
 +}
@@ -221,6 +221,13 @@ index e69de29..127c9de 100644
 +		var failure *phoneFailure
 +		if !errors.As(err, &failure) {
 +			failure = &phoneFailure{category: "internal", status: http.StatusInternalServerError}
++		}
++		if p.session != nil && p.session.state == "sms_required" {
++			response = p.challengeLocked(p.session)
++			response.Error = failure.category
++			response.ProviderCode = failure.providerCode
++			api.ResponseJSON(w, response)
++			return
 +		}
 +		phoneErrorResponse(w, failure.status, failure.category, failure.providerCode)
 +		return
@@ -370,7 +377,11 @@ index e69de29..127c9de 100644
 +	if p.session == nil || p.session.state != "sms_required" {
 +		return phoneResponse{}, phoneFail("input", http.StatusConflict)
 +	}
-+	return p.sendForSessionLocked(p.session)
++	response, err := p.sendForSessionLocked(p.session)
++	if err != nil && !phoneChallengeRecoverable(err) {
++		p.clearSessionLocked(p.session)
++	}
++	return response, err
 +}
 +
 +func (p *phoneBootstrap) sendForSessionLocked(session *phoneSession) (phoneResponse, error) {
@@ -413,11 +424,17 @@ index e69de29..127c9de 100644
 +	session.retryAfter = wait
 +	p.armSessionTimerLocked(session)
 +	return phoneResponse{
-+		State:             session.state,
-+		MaskedTarget:      maskedPhoneTarget(session.nationalNumber),
-+		CodeLength:        data.VCodeLen,
-+		RetryAfterSeconds: wait,
++		State: session.state, MaskedTarget: maskedPhoneTarget(session.nationalNumber),
++		CodeLength: data.VCodeLen, RetryAfterSeconds: &wait,
 +	}, nil
++}
++
++func (p *phoneBootstrap) challengeLocked(session *phoneSession) phoneResponse {
++	// A failed verification or resend did not send an SMS. The C owner keeps
++	// the original deadline; do not restart it with the previous wait duration.
++	remaining := 0
++	return phoneResponse{State: "sms_required", MaskedTarget: maskedPhoneTarget(session.nationalNumber),
++		CodeLength: session.codeLength, RetryAfterSeconds: &remaining}
 +}
 +
 +func (p *phoneBootstrap) verifyLocked(code string) (phoneResponse, error) {
@@ -427,7 +444,11 @@ index e69de29..127c9de 100644
 +	}
 +	session.state = "verifying"
 +	if err := p.phoneInfoLocked(session, code); err != nil {
-+		p.clearSessionLocked(session)
++		if phoneChallengeRecoverable(err) {
++			session.state = "sms_required"
++		} else {
++			p.clearSessionLocked(session)
++		}
 +		return phoneResponse{}, err
 +	}
 +	if !hasCookie(session.jar, p.passportBase, "ticketToken") {
@@ -436,7 +457,11 @@ index e69de29..127c9de 100644
 +	}
 +	userID, candidateToken, err := p.ticketAuthLocked(session, code)
 +	if err != nil {
-+		p.clearSessionLocked(session)
++		if phoneChallengeRecoverable(err) {
++			session.state = "sms_required"
++		} else {
++			p.clearSessionLocked(session)
++		}
 +		return phoneResponse{}, err
 +	}
 +
@@ -468,6 +493,19 @@ index e69de29..127c9de 100644
 +	cloudsMu.Unlock()
 +	p.clearSessionLocked(session)
 +	return phoneResponse{State: "authenticated"}, nil
++}
++
++func phoneChallengeRecoverable(err error) bool {
++	var failure *phoneFailure
++	if !errors.As(err, &failure) {
++		return false
++	}
++	switch failure.category {
++	case "sms_code_invalid_or_expired", "network", "provider", "rate_limit", "sms_send_limit_tomorrow":
++		return true
++	default:
++		return false
++	}
 +}
 +
 +func (p *phoneBootstrap) phoneInfoLocked(session *phoneSession, code string) error {

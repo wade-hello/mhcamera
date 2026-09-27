@@ -439,12 +439,12 @@ function normalizeCameraListResult(result) {
   if (stateCode === CatalogState.RETRYING && projection.last_error === null) throw protocolError();
   const validItems = projection.items.every((camera) => (
     isRecord(camera) &&
-    typeof camera.id === "string" && /^[0-9]+$/.test(camera.id) &&
+    typeof camera.id === "string" && camera.id.length > 0 &&
     typeof camera.name === "string" &&
     typeof camera.model === "string" &&
-    typeof camera.home_id === "string" && (camera.home_id === "" || /^[0-9]+$/.test(camera.home_id)) &&
+    typeof camera.home_id === "string" &&
     typeof camera.home_name === "string" &&
-    typeof camera.room_id === "string" && (camera.room_id === "" || /^[0-9]+$/.test(camera.room_id)) &&
+    typeof camera.room_id === "string" &&
     typeof camera.room_name === "string"
   ));
   if (!validItems) throw protocolError();
@@ -484,7 +484,7 @@ function normalizeCameraStatusResult(result) {
     if (!isRecord(projection.selected)) throw protocolError();
     const hasChannel = Object.prototype.hasOwnProperty.call(projection.selected, "channel");
     if (
-      typeof projection.selected.id !== "string" || !/^[0-9]+$/.test(projection.selected.id) ||
+      typeof projection.selected.id !== "string" || projection.selected.id.length === 0 ||
       !CAMERA_REGION_SET.has(projection.selected.region) ||
       typeof projection.selected.name !== "string" ||
       typeof projection.selected.model !== "string" ||
@@ -606,6 +606,10 @@ function errorMessageKey(error) {
   const projection = error instanceof CameraRouteError
     ? error.projection
     : stableErrorProjection(error || {});
+  if (projection.message_key === "input") return "invalidRequest";
+  if (projection.message_key === "network") return "networkError";
+  if (projection.message_key === "protocol") return "protocolError";
+  if (projection.message_key === "internal") return "requestFailed";
   if (projection.provider_code === 70022 || projection.message_key === "sms_send_limit_tomorrow") {
     return "sms_send_limit_tomorrow";
   }
@@ -623,7 +627,11 @@ function errorMessageKey(error) {
     "invalid_region",
     "catalog_incomplete",
     "catalog_retry_exhausted",
-    "selected_camera_unavailable"
+    "selected_camera_unavailable",
+    "source_set_failed",
+    "media_start_failed",
+    "media_session_failed",
+    "selection_persist_failed"
   ].includes(projection.message_key)) {
     return projection.message_key;
   }
